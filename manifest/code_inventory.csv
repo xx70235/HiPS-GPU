@@ -1,0 +1,29 @@
+path,category,role
+README.md,meta,top-level repository overview
+LICENSE,meta,license file for public release
+.gitignore,meta,git ignore rules for build and generated outputs
+requirements.txt,meta,python dependency list for paper scripts
+project_paths.py,meta,shared path and environment-variable helpers
+core/README.md,core,core build instructions
+core/Makefile,core,build entry point for hips-gpu engine
+core/AUTO_ORDER_CALCULATION.md,core,notes on auto-order selection
+core/DESI_OPTIMIZATION_README.md,core,optimization notes for DESI workloads
+core/benchmark_experiment.sh,core,core-engine benchmark helper
+core/run_benchmark.sh,core,core-engine benchmark helper
+core/run_full_benchmark.sh,core,core-engine benchmark helper
+core/src/cpp/hipsgen_cuda.cpp,core,main GPU HiPS engine entry point
+core/src/cpp/*.cu,core,CUDA kernels and GPU processing code
+core/src/cpp/*.cpp,core,C++ implementation and helper tools
+core/src/cpp/*.h,core,headers for the core engine
+benchmarks/compare_hips_outputs.py,benchmark,compare GPU and Java HiPS outputs
+benchmarks/run_paper_benchmarks_remote.sh,benchmark,run remote paper benchmarks
+validation/end_to_end_validation.py,validation,synthetic three-telescope recovery experiment
+validation/generate_real_result_figures.py,validation,generate benchmark and validation figures
+validation/measure_latency_budget.py,validation,measure synthetic latency budget
+case_studies/ep260110a_case_study.py,case_study,real null-result workflow driver
+case_studies/ep260110a_generate_outputs.py,case_study,generate EP260110a figures and tables
+case_studies/ep260214b_case_study.py,case_study,real positive-follow-up workflow driver
+runtime/calibrate.py,runtime,bias and flat reduction helpers
+runtime/hips_processor.py,runtime,local HiPS build and original-image diff helpers
+runtime/hips_runtime.py,runtime,HiPS/HpxFinder runtime lookup and differencing
+runtime/photometry.py,runtime,photometry and calibration helpers

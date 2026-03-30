@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+.venv/
+build/
+dist/
+generated_outputs/
+obj/
+bin/
+*.log
+*.aux
+*.out
+*.pdf
+*.png
