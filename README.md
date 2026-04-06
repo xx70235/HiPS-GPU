@@ -1,84 +1,222 @@
-# HiPS-GPU: Paper Code Bundle (`v3`)
+# HiPS-GPU
 
-This repository snapshot packages the code used by the paper
-`GPU_HiPS_TimeDomain_Paper_APJS_rev_v3.tex`.
+HiPS-GPU is a CUDA/C++ software package for generating image HiPS products on
+NVIDIA GPUs. The main deliverable in this repository is the command-line
+generator `hipsgen_cuda`, which reads a directory of FITS images with valid WCS
+headers and writes a HiPS directory tree with tiles, metadata, and HpxFinder
+provenance files.
 
-It combines two layers:
+This repository also contains optional Python utilities for benchmarking,
+runtime integration, validation, and the case studies used in the accompanying
+paper. Those scripts are included as extras. The core package is the GPU HiPS
+generator under `core/`.
 
-- the core CUDA/C++ `hips-gpu` engine for accelerated HiPS generation
-- the paper-facing Python scripts used for benchmarks, synthetic validation,
-  real-event case studies, and figure generation
+## What This Repository Is For
 
-This code bundle is intended to be close to a public GitHub release. It is
-still a research snapshot rather than a polished software product, but the
-main source tree, benchmark scripts, and paper-analysis scripts have been
-collected into a single standalone layout.
+- Build and run a GPU-accelerated HiPS generator on your own FITS image sets
+- Produce standard-style HiPS directory outputs, including HpxFinder indices
+- Compare GPU output with the CDS Java reference implementation when needed
+- Reuse the included Python helpers for validation or workflow integration
 
-## Repository Layout
+## Main Components
 
 - `core/`
-  - main CUDA/C++ HiPS engine source tree
-  - `Makefile`
-  - benchmark helper scripts
-- `benchmarks/`
-  - comparison scripts used in the paper benchmark section
-- `validation/`
-  - synthetic end-to-end validation scripts
-  - figure-generation helpers
-  - latency-budget measurement script
-- `case_studies/`
-  - real-event case-study drivers for `EP260110a` and `EP260214b`
+  - CUDA/C++ source for `hipsgen_cuda`
+  - build system and low-level benchmark helpers
 - `runtime/`
-  - lightweight runtime modules shared by the paper scripts
+  - Python helpers that call the compiled generator in larger workflows
+- `benchmarks/`
+  - scripts for comparing GPU and Java HiPS generation
+- `validation/`
+  - synthetic validation and figure-generation utilities
+- `case_studies/`
+  - real-event workflow scripts used in the paper
 - `manifest/`
-  - inventory files for this bundle
-- `project_paths.py`
-  - shared path helpers and environment-variable based defaults
+  - bundle inventory files
 
-## What Is Included
+## System Requirements
 
-- core engine source code (`core/src/cpp/`)
-- build instructions and benchmark helpers (`core/Makefile`, shell scripts)
-- Python scripts for:
-  - output comparison
-  - synthetic injection/recovery validation
-  - latency measurement
-  - real-event case studies
-  - paper figure generation
+HiPS-GPU is currently aimed at Linux systems with an NVIDIA GPU.
 
-## What Is Not Included
+Required toolchain and libraries:
 
-- the full production follow-up platform
-- database schema migrations and API service deployment
-- large FITS datasets
-- generated PNG, PDF, and CSV products
+- `nvcc`
+- `g++`
+- CUDA runtime libraries
+- CFITSIO
+- WCSLIB
+- Healpix C++ library
 
-For figure inputs and paper-ready figure outputs, use the separate data bundle:
+The supplied `core/Makefile` currently links against:
 
-- `../paper_figure_sources_v3/`
+- `-lcfitsio`
+- `-lwcs`
+- `-lhealpix_cxx`
+- CUDA runtime libraries
 
-## Quick Start
+You may need to adjust include paths, library paths, or the CUDA architecture
+flag in `core/Makefile` for your own machine. The current default build uses
+`-arch=sm_75`.
 
-### 1. Build the core GPU engine
+## Build
+
+Build the generator from the repository root:
 
 ```bash
 cd core
 make
 ```
 
-This should produce:
+Expected output:
 
 ```bash
 core/bin/hipsgen_cuda
 ```
 
-The provided `Makefile` assumes a local environment with CUDA and FITS/WCS
-libraries already available.
+If the build succeeds, the package is ready to use. The Java `Hipsgen.jar` is
+not required for normal operation. It is only needed if you want to run the
+comparison benchmarks against the CDS reference implementation.
 
-Benchmark scripts that compare against the official Java reference path also
-require a local copy of `Hipsgen.jar`, which is not redistributed here.
+## Quick Start
 
-### 2. Install Python dependencies
+The generator expects:
+
+- an input directory containing FITS images
+- valid WCS headers in those FITS files
+- an output directory where the HiPS tree will be written
+
+Minimal example:
+
+```bash
+core/bin/hipsgen_cuda /path/to/input_fits /path/to/output_hips
+```
+
+Explicit order and overlay mode:
+
+```bash
+core/bin/hipsgen_cuda /path/to/input_fits /path/to/output_hips \
+  -order 7 \
+  -mode MEAN
+```
+
+Recursive scan with filename filtering:
+
+```bash
+core/bin/hipsgen_cuda /path/to/input_fits /path/to/output_hips \
+  -r \
+  -pattern "*-image-r.fits.fz" \
+  -order 7
+```
+
+CPU fallback for debugging:
+
+```bash
+core/bin/hipsgen_cuda /path/to/input_fits /path/to/output_hips \
+  -order 7 \
+  -cpu
+```
+
+## Command-Line Interface
+
+Usage:
+
+```bash
+hipsgen_cuda <input_dir> <output_dir> [options]
+```
+
+Common options:
+
+- `-order <n>`
+  set the maximum HEALPix order; if omitted, the code can choose an order
+  automatically from image scale
+- `-threads <n>`
+  set the host-side thread count
+- `-mode <NONE|MEAN|AVERAGE|FADING|ADD>`
+  choose the overlay mode for overlapping source images
+- `-img <file>`
+  use a reference image for default initializations
+- `-blank <value>`
+  set the blank pixel value explicitly
+- `-validRange <min> <max>`
+  accept only pixels within a given range
+- `-autoValidRange`
+  estimate a valid range by sampling source data
+- `-sampleRatio <r>`
+  control the sampling fraction used by `-autoValidRange`
+- `-r` or `-recursive`
+  scan subdirectories recursively
+- `-pattern <glob>`
+  process only files matching a glob pattern
+- `-limit <n>`
+  limit the number of files processed
+- `-cache <n>`
+  control the in-memory FITS cache size
+- `-progress <n>`
+  control progress-report frequency
+- `-no-index`
+  skip the HpxFinder/INDEX stage
+- `-no-tiles`
+  skip the TILES stage
+- `-cpu`
+  force CPU mode
+- `-v`
+  enable verbose logging
+
+## Input Expectations
+
+HiPS-GPU is intended for image collections that:
+
+- are stored as FITS files
+- contain valid celestial WCS metadata
+- can be projected onto a common HiPS frame
+
+The code is most useful when you want to generate HiPS products from many
+input images quickly, especially when overlap is high or when low-latency
+incremental generation matters.
+
+## Output Layout
+
+The generator writes a HiPS-style output tree such as:
+
+```text
+output_hips/
+  HpxFinder/
+  Norder0/
+  Norder1/
+  ...
+  NorderN/
+  properties
+```
+
+Depending on settings and stages, the output may also include:
+
+- `Allsky.fits`
+- `index.html`
+- lower-order tiles derived from the target order
+
+The `HpxFinder/` subtree stores provenance mappings from HiPS cells back to
+contributing source images.
+
+## Typical Workflow
+
+1. Prepare a directory of FITS images on fast local storage.
+2. Build `core/bin/hipsgen_cuda`.
+3. Run the generator with a target order or allow auto-order selection.
+4. Inspect the resulting `Norder*`, `HpxFinder`, and `properties` outputs.
+5. Serve or post-process the generated HiPS product in your own environment.
+
+For large datasets, local NVMe or SSD staging is strongly recommended.
+
+## Python Utilities
+
+The Python scripts are optional. They are useful if you want to:
+
+- integrate `hipsgen_cuda` into a larger time-domain workflow
+- run synthetic validation
+- reproduce the paper benchmarks
+- generate analysis figures
+
+Install the optional Python dependencies with:
 
 ```bash
 python3 -m venv .venv
@@ -86,87 +224,36 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 3. Point the paper scripts to the data bundle
-
-By default, the Python scripts look for data in a sibling directory:
-
-```bash
-../paper_figure_sources_v3/data
-```
-
-If your data live elsewhere, set:
-
-```bash
-export HIPS_GPU_PAPER_DATA_ROOT=/path/to/paper_figure_sources_v3/data
-```
-
-Optional output location:
-
-```bash
-export HIPS_GPU_PAPER_OUTPUT_ROOT=/path/to/generated_outputs
-```
-
-Optional figure output location:
-
-```bash
-export HIPS_GPU_PAPER_DOCS_ROOT=/path/to/generated_outputs/docs
-```
-
-### 4. Run paper scripts
-
-Examples:
-
-```bash
-python validation/generate_real_result_figures.py
-python validation/measure_latency_budget.py
-python case_studies/ep260110a_generate_outputs.py
-```
-
-The two real-event case-study driver scripts require raw input images that are
-not redistributed in this repository snapshot. Those scripts therefore need
-additional environment variables pointing to local raw data directories.
-
-## Environment Variables
+Important environment variables used by the Python helpers:
 
 - `HIPSGEN_BIN`
-  - path to the compiled `hipsgen_cuda` binary
+  path to the compiled `hipsgen_cuda` binary
 - `HIPS_SCRATCH`
-  - scratch/output path for runtime helpers
+  scratch directory for runtime helpers
 - `HIPS_GPU_PAPER_DATA_ROOT`
-  - root of the companion paper data bundle
+  location of the companion paper data bundle
 - `HIPS_GPU_PAPER_OUTPUT_ROOT`
-  - root for generated outputs
+  output root for generated Python-script products
 - `HIPS_GPU_PAPER_DOCS_ROOT`
-  - directory for generated figure files
-- `HIPS_GPU_EP260110A_XL100_DIR`
-  - raw XL100 directory for the `EP260110a` case study
-- `HIPS_GPU_EP260110A_TRT_DIR`
-  - raw TRT directory for the `EP260110a` case study
-- `HIPS_GPU_EP260110A_OUTPUT_DIR`
-  - output directory for the `EP260110a` case study
-- `HIPS_GPU_EP260214B_RAW_ROOT`
-  - raw data root for the `EP260214b` case study
-- `HIPS_GPU_EP260214B_OUTPUT_DIR`
-  - output directory for the `EP260214b` case study
+  figure output directory
 
-## Notes on Portability
+If you only want the GPU HiPS generator itself, you can ignore the Python
+utilities entirely.
 
-The original working environment used site-specific filesystem layouts. The
-most visible absolute paths have been replaced by environment-variable based
-defaults or project-relative fallbacks, but this remains a research codebase.
-Before a formal public release, you may still want to:
+## Benchmarking and Paper Reproduction
 
-1. audit the build toolchain assumptions in `core/Makefile`
-2. test the Python scripts in a fresh environment
-3. decide which datasets can be redistributed and which should remain
-   fetch-on-demand
+This repository can still be used for the paper workflows, but that is not its
+only purpose.
 
-## Citation / Provenance
+Relevant directories:
 
-The file inventory for this bundle is listed in:
+- `benchmarks/` for GPU vs. Java comparison helpers
+- `validation/` for synthetic validation scripts
+- `case_studies/` for real-event workflow examples
 
-- `manifest/code_inventory.csv`
+Some of those scripts expect local datasets that are not redistributed in this
+repository.
 
-The corresponding figure/data bundle is documented separately in:
+## License
 
-- `../paper_figure_sources_v3/README.md`
+This repository is released under the MIT License. See `LICENSE`.
