@@ -6,6 +6,7 @@
 #include "hpx_finder.h"
 #include "index_gpu_processor.h"
 #include "fits_header_reader.h"
+#include "index_merge_utils.h"
 #include <fstream>
 #include <sstream>
 #include <iostream>
@@ -27,46 +28,115 @@ static std::mutex g_indexMutex;
 // 是否启用GPU加速（默认启用）
 static bool g_useGPU = true;
 
-/**
- * 生成INDEX阶段的空间索引（GPU加速版本）
- */
-bool HpxFinder::generateIndex(const std::string& inputDir, 
-                              const std::string& outputDir, 
-                              int orderMax) {
-    std::string hpxFinderPath = outputDir + "/HpxFinder";
-    
-    std::cout << "开始生成HpxFinder索引..." << std::endl;
-    std::cout << "输入目录: " << inputDir << std::endl;
-    std::cout << "输出目录: " << hpxFinderPath << std::endl;
-    std::cout << "最大order: " << orderMax << std::endl;
-    
-    // 创建HpxFinder目录结构
-    for (int order = 0; order <= orderMax; order++) {
+namespace {
+
+std::string makeStoredSourcePath(const std::string& fitsPath,
+                                 const std::string& inputDir,
+                                 const std::string& sourceRootDir) {
+    fs::path basePath = sourceRootDir.empty() ? fs::path(inputDir) : fs::path(sourceRootDir);
+    fs::path inputPath(fitsPath);
+
+    std::string storedPath;
+    fs::path lexicalRelative = inputPath.lexically_relative(basePath);
+    if (!lexicalRelative.empty()) {
+        storedPath = lexicalRelative.generic_string();
+        if (storedPath == "." || storedPath.rfind("../", 0) == 0) {
+            storedPath.clear();
+        }
+    }
+
+    if (storedPath.empty()) {
+        std::error_code ec;
+        fs::path relativePath = fs::relative(inputPath, basePath, ec);
+        if (!ec) {
+            storedPath = relativePath.generic_string();
+            if (storedPath == "." || storedPath.empty() || storedPath.rfind("../", 0) == 0) {
+                storedPath.clear();
+            }
+        }
+    }
+
+    if (storedPath.empty()) {
+        storedPath = inputPath.filename().generic_string();
+    }
+    return storedPath;
+}
+
+FitsData makeMetadataFitsData(const std::string& filename, const WCSInfo& wcs) {
+    FitsData data;
+    data.filename = filename;
+    data.width = wcs.width;
+    data.height = wcs.height;
+    data.depth = 1;
+    data.crval1 = wcs.crval1;
+    data.crval2 = wcs.crval2;
+    data.crpix1 = wcs.crpix1;
+    data.crpix2 = wcs.crpix2;
+    data.cd1_1 = wcs.cd1_1;
+    data.cd1_2 = wcs.cd1_2;
+    data.cd2_1 = wcs.cd2_1;
+    data.cd2_2 = wcs.cd2_2;
+    data.blank = std::numeric_limits<double>::quiet_NaN();
+    data.isValid = wcs.valid;
+    return data;
+}
+
+std::vector<std::string> collectFitsFilesRecursive(const std::string& inputDir) {
+    std::vector<std::string> fitsFiles;
+    if (fs::exists(inputDir) && fs::is_directory(inputDir)) {
+        for (const auto& entry : fs::recursive_directory_iterator(inputDir)) {
+            if (!entry.is_regular_file()) {
+                continue;
+            }
+            std::string ext = entry.path().extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+            if (ext == ".fits" || ext == ".fit" || ext == ".fts" || ext == ".img" || ext == ".fz") {
+                fitsFiles.push_back(entry.path().string());
+            }
+        }
+    }
+    return fitsFiles;
+}
+
+void ensureOrderDirectories(const std::string& hpxFinderPath, int orderMin, int orderMax) {
+    for (int order = orderMin; order <= orderMax; ++order) {
         long nside = HealpixUtil::norderToNside(order);
         long totalPixels = HealpixUtil::getTotalPixelsFromNside(nside);
         int maxDir = (int)(totalPixels / 100000) + 1;
         maxDir = std::min(maxDir, 1000);
-        
+
         for (int dir = 0; dir < maxDir; dir++) {
             std::ostringstream oss;
             oss << hpxFinderPath << "/Norder" << order << "/Dir" << dir;
             fs::create_directories(oss.str());
         }
     }
+}
+
+}  // namespace
+
+/**
+ * 生成INDEX阶段的空间索引（GPU加速版本）
+ */
+bool HpxFinder::generateIndex(const std::string& inputDir, 
+                              const std::string& outputDir, 
+                              int orderMax,
+                              const std::string& sourceRootDir) {
+    std::string hpxFinderPath = outputDir + "/HpxFinder";
+    
+    std::cout << "开始生成HpxFinder索引..." << std::endl;
+    std::cout << "输入目录: " << inputDir << std::endl;
+    std::cout << "输出目录: " << hpxFinderPath << std::endl;
+    std::cout << "最大order: " << orderMax << std::endl;
+    if (!sourceRootDir.empty()) {
+        std::cout << "源数据根目录: " << sourceRootDir << std::endl;
+    }
+    
+    // 创建HpxFinder目录结构
+    ensureOrderDirectories(hpxFinderPath, 0, orderMax);
     
     // 扫描输入目录中的FITS文件
-    std::vector<std::string> fitsFiles;
-    if (fs::exists(inputDir) && fs::is_directory(inputDir)) {
-        for (const auto& entry : fs::recursive_directory_iterator(inputDir)) {
-            if (entry.is_regular_file()) {
-                std::string ext = entry.path().extension().string();
-                std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-                if (ext == ".fits" || ext == ".fit" || ext == ".fts" || ext == ".img" || ext == ".fz") {
-                    fitsFiles.push_back(entry.path().string());
-                }
-            }
-        }
-    }
+    std::vector<std::string> fitsFiles = collectFitsFilesRecursive(inputDir);
     
     std::cout << "找到 " << fitsFiles.size() << " 个FITS文件" << std::endl;
     
@@ -88,6 +158,7 @@ bool HpxFinder::generateIndex(const std::string& inputDir,
         std::vector<ImageWCSParams> wcsParams(fitsFiles.size());
         std::atomic<int> processedCount(0);
         std::atomic<int> validCount(0);
+        std::atomic<int> invalidCount(0);
         
         int numThreads = std::min((int)std::thread::hardware_concurrency(), 16);
         numThreads = std::max(numThreads, 1);
@@ -105,10 +176,12 @@ bool HpxFinder::generateIndex(const std::string& inputDir,
                     std::cout << "读取进度: " << count << "/" << fitsFiles.size() << std::endl;
                 }
                 
-                if (!wcs.valid) continue;
+                if (!wcs.valid) {
+                    ++invalidCount;
+                    continue;
+                }
                 
-                std::string relPath = fs::relative(fitsPath, inputDir).string();
-                std::replace(relPath.begin(), relPath.end(), '\\', '/');
+                std::string relPath = makeStoredSourcePath(fitsPath, inputDir, sourceRootDir);
                 
                 long cellMem = (long)wcs.width * wcs.height * 4;  // 假设float
                 
@@ -140,7 +213,7 @@ bool HpxFinder::generateIndex(const std::string& inputDir,
         auto readEndTime = std::chrono::high_resolution_clock::now();
         auto readMs = std::chrono::duration_cast<std::chrono::milliseconds>(readEndTime - readStartTime).count();
         std::cout << "FITS文件头读取完成: " << validCount << "/" << fitsFiles.size() 
-                  << " 有效, 耗时 " << readMs << " ms" << std::endl;
+                  << " 有效, " << invalidCount << " 无效, 耗时 " << readMs << " ms" << std::endl;
         
         std::vector<ImageWCSParams> validParams;
         for (const auto& p : wcsParams) {
@@ -185,8 +258,7 @@ bool HpxFinder::generateIndex(const std::string& inputDir,
             FitsData fits = FitsReader::readFitsFile(fitsPath);
             if (!fits.isValid) continue;
             
-            std::string relPath = fs::relative(fitsPath, inputDir).string();
-            std::replace(relPath.begin(), relPath.end(), '\\', '/');
+            std::string relPath = makeStoredSourcePath(fitsPath, inputDir, sourceRootDir);
             
             long cellMem = (long)fits.width * fits.height * (abs(fits.bitpix) / 8);
             if (fits.bitpix == 0) cellMem = fits.width * fits.height * 4;
@@ -236,6 +308,93 @@ bool HpxFinder::generateIndex(const std::string& inputDir,
     std::cout << "INDEX stage completed!" << std::endl;
     std::cout << "Total written index files: " << writtenFiles << std::endl;
     
+    return true;
+}
+
+bool HpxFinder::appendIndex(const std::string& inputDir,
+                            const std::string& outputDir,
+                            int orderMax,
+                            const std::string& sourceRootDir,
+                            std::vector<long>* dirtyOrderMaxTiles) {
+    std::string hpxFinderPath = outputDir + "/HpxFinder";
+    std::string effectiveSourceRoot = sourceRootDir.empty() ? inputDir : sourceRootDir;
+
+    std::cout << "开始追加HpxFinder索引..." << std::endl;
+    std::cout << "新批次输入目录: " << inputDir << std::endl;
+    std::cout << "输出目录: " << hpxFinderPath << std::endl;
+    std::cout << "最大order: " << orderMax << std::endl;
+    std::cout << "源数据根目录: " << effectiveSourceRoot << std::endl;
+
+    ensureOrderDirectories(hpxFinderPath, orderMax, orderMax);
+
+    std::vector<std::string> fitsFiles = collectFitsFilesRecursive(inputDir);
+    std::cout << "找到 " << fitsFiles.size() << " 个待追加FITS文件" << std::endl;
+
+    if (dirtyOrderMaxTiles != nullptr) {
+        dirtyOrderMaxTiles->clear();
+    }
+    if (fitsFiles.empty()) {
+        return true;
+    }
+
+    auto wcsInfos = FastFitsHeaderReader::readWCSInfoBatch(fitsFiles);
+    std::map<long, std::vector<SourceFileInfo>> incomingByTile;
+    int validFiles = 0;
+    int invalidFiles = 0;
+
+    for (size_t i = 0; i < fitsFiles.size(); ++i) {
+        if (i >= wcsInfos.size() || !wcsInfos[i].valid) {
+            invalidFiles++;
+            continue;
+        }
+
+        FitsData meta = makeMetadataFitsData(fitsFiles[i], wcsInfos[i]);
+        std::string relPath = makeStoredSourcePath(fitsFiles[i], inputDir, effectiveSourceRoot);
+        long cellMem = (long)wcsInfos[i].width * wcsInfos[i].height * 4;
+        SourceFileInfo srcInfo(relPath, cellMem);
+
+        std::vector<long> coverage = computeCoverage(meta, orderMax);
+        for (long npix : coverage) {
+            incomingByTile[npix].push_back(srcInfo);
+        }
+        validFiles++;
+    }
+
+    std::vector<long> dirtyTiles;
+    int updatedIndexFiles = 0;
+    int unchangedIndexFiles = 0;
+
+    for (auto& entry : incomingByTile) {
+        long npix = entry.first;
+        int dir = HealpixUtil::getDirNumber(npix);
+        std::ostringstream oss;
+        oss << hpxFinderPath << "/Norder" << orderMax << "/Dir" << dir << "/Npix" << npix;
+        std::string indexPath = oss.str();
+
+        std::vector<SourceFileInfo> existing = readIndexFile(indexPath);
+        bool changed = merge_source_files_unique(existing, entry.second);
+        if (changed) {
+            writeIndexFile(indexPath, existing);
+            dirtyTiles.push_back(npix);
+            updatedIndexFiles++;
+        } else {
+            unchangedIndexFiles++;
+        }
+    }
+
+    std::sort(dirtyTiles.begin(), dirtyTiles.end());
+    dirtyTiles.erase(std::unique(dirtyTiles.begin(), dirtyTiles.end()), dirtyTiles.end());
+    if (dirtyOrderMaxTiles != nullptr) {
+        *dirtyOrderMaxTiles = dirtyTiles;
+    }
+
+    std::cout << "追加索引完成: valid=" << validFiles
+              << ", invalid=" << invalidFiles
+              << ", touched=" << incomingByTile.size()
+              << ", updated=" << updatedIndexFiles
+              << ", unchanged=" << unchangedIndexFiles
+              << ", dirty orderMax tiles=" << dirtyTiles.size() << std::endl;
+
     return true;
 }
 

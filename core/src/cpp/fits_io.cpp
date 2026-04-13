@@ -4,6 +4,7 @@
  */
 
 #include "fits_io.h"
+#include "fits_hdu_utils.h"
 #include <fstream>
 #include <sstream>
 #include <iomanip>
@@ -66,72 +67,22 @@ FitsData FitsReader::readFitsFileCFITSIO(const std::string& filename, int hdu) {
         return data;
     }
     
-    // ====== 智能 HDU 检测：自动找到有效的图像 HDU ======
-    int num_hdus = 1;
-    int hdu_detect_status = 0;
-    fits_get_num_hdus(fptr, &num_hdus, &hdu_detect_status);
-    
-    bool foundValidHDU = false;
-    int targetHDU = hdu + 1;  // 优先使用用户指定的 HDU (CFITSIO 使用 1-based)
-    
-    // 对于 .fz 压缩文件，优先尝试 HDU 2 (压缩数据通常在此)
-    std::string fileExt = filename;
-    size_t lastDot = fileExt.find_last_of(".");
-    if (lastDot != std::string::npos) {
-        fileExt = fileExt.substr(lastDot + 1);
-        std::transform(fileExt.begin(), fileExt.end(), fileExt.begin(), ::tolower);
-        if (fileExt == "fz" && hdu == 0) {
-            targetHDU = 2;  // fpack 压缩文件，图像通常在 HDU 2
-        }
-    }
-    
-    // 尝试移动到目标 HDU
-    int temp_hdutype;
-    hdu_detect_status = 0;
-    if (fits_movabs_hdu(fptr, targetHDU, &temp_hdutype, &hdu_detect_status) == 0) {
-        int test_naxis = 0;
-        hdu_detect_status = 0;
-        fits_get_img_dim(fptr, &test_naxis, &hdu_detect_status);
-        if (hdu_detect_status == 0 && test_naxis > 0) {
-            foundValidHDU = true;
-        }
-    }
-    
-    // 如果目标 HDU 无效，搜索所有 HDU 找第一个有效的图像
-    if (!foundValidHDU) {
-        for (int i = 1; i <= num_hdus && !foundValidHDU; i++) {
-            hdu_detect_status = 0;
-            if (fits_movabs_hdu(fptr, i, &temp_hdutype, &hdu_detect_status) == 0) {
-                if (temp_hdutype == IMAGE_HDU) {
-                    int test_naxis = 0;
-                    hdu_detect_status = 0;
-                    fits_get_img_dim(fptr, &test_naxis, &hdu_detect_status);
-                    if (hdu_detect_status == 0 && test_naxis > 0) {
-                        foundValidHDU = true;
-                        targetHDU = i;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    
-    if (!foundValidHDU) {
+    HduSelectionResult selection = select_valid_image_hdu(fptr, filename, hdu);
+    if (!selection.found) {
         fits_close_file(fptr, &status);
-        data.errorMessage = "No valid image HDU found in file";
+        data.errorMessage = selection.error;
         data.isValid = false;
         return data;
     }
     
     // 移动到找到的有效 HDU
     status = 0;
-    if (fits_movabs_hdu(fptr, targetHDU, &hdutype, &status)) {
+    if (fits_movabs_hdu(fptr, selection.hdu_index_1_based, &hdutype, &status)) {
         fits_close_file(fptr, &status);
         data.errorMessage = "Failed to move to HDU";
         data.isValid = false;
         return data;
     }
-    // ====== HDU 检测结束 ======
     
     // 读取图像尺寸
     if (fits_get_img_dim(fptr, &naxis, &status)) {
@@ -256,6 +207,211 @@ FitsData FitsReader::readFitsFileCFITSIO(const std::string& filename, int hdu) {
 #endif
     
     return data;
+}
+
+FitsData FitsReader::readFitsCutout(const std::string& filename, const PixelBounds& bounds, int hdu) {
+    FitsData data;
+    data.filename = filename;
+
+    if (bounds.width <= 0 || bounds.height <= 0) {
+        data.isValid = false;
+        data.errorMessage = "Invalid cutout bounds";
+        return data;
+    }
+
+#ifdef USE_CFITSIO
+    fitsfile* fptr = nullptr;
+    int status = 0;
+    int hdutype = 0;
+    long naxes[3] = {1, 1, 1};
+    int naxis = 0;
+
+    if (fits_open_file(&fptr, filename.c_str(), READONLY, &status)) {
+        data.errorMessage = "Failed to open FITS file";
+        data.isValid = false;
+        return data;
+    }
+
+    HduSelectionResult selection = select_valid_image_hdu(fptr, filename, hdu);
+    if (!selection.found) {
+        fits_close_file(fptr, &status);
+        data.errorMessage = selection.error;
+        data.isValid = false;
+        return data;
+    }
+
+    status = 0;
+    if (fits_movabs_hdu(fptr, selection.hdu_index_1_based, &hdutype, &status)) {
+        fits_close_file(fptr, &status);
+        data.errorMessage = "Failed to move to HDU";
+        data.isValid = false;
+        return data;
+    }
+
+    if (fits_get_img_dim(fptr, &naxis, &status)) {
+        fits_close_file(fptr, &status);
+        data.errorMessage = "Failed to get image dimensions";
+        data.isValid = false;
+        return data;
+    }
+
+    if (fits_get_img_size(fptr, 3, naxes, &status)) {
+        fits_close_file(fptr, &status);
+        data.errorMessage = "Failed to get image size";
+        data.isValid = false;
+        return data;
+    }
+
+    if (naxis < 2) {
+        fits_close_file(fptr, &status);
+        data.errorMessage = "FITS image has fewer than 2 dimensions";
+        data.isValid = false;
+        return data;
+    }
+
+    const int fullWidth = static_cast<int>(naxes[0]);
+    const int fullHeight = static_cast<int>(naxes[1]);
+    const int depth = (naxis >= 3) ? static_cast<int>(naxes[2]) : 1;
+
+    const int x0 = std::max(0, bounds.x0);
+    const int y0 = std::max(0, bounds.y0);
+    const int x1 = std::min(fullWidth, bounds.x0 + bounds.width);
+    const int y1 = std::min(fullHeight, bounds.y0 + bounds.height);
+
+    if (x0 >= x1 || y0 >= y1) {
+        fits_close_file(fptr, &status);
+        data.errorMessage = "Cutout bounds outside image";
+        data.isValid = false;
+        return data;
+    }
+
+    data.width = x1 - x0;
+    data.height = y1 - y0;
+    data.depth = depth;
+
+    int bitpix = 0;
+    if (fits_get_img_type(fptr, &bitpix, &status)) {
+        fits_close_file(fptr, &status);
+        data.errorMessage = "Failed to get BITPIX";
+        data.isValid = false;
+        return data;
+    }
+    data.bitpix = bitpix;
+
+    double crval1 = 0.0, crval2 = 0.0;
+    double crpix1 = 0.0, crpix2 = 0.0;
+    double cd1_1 = 0.0, cd1_2 = 0.0, cd2_1 = 0.0, cd2_2 = 0.0;
+    char ctype1[80] = "", ctype2[80] = "";
+    int wcsStatus = 0;
+
+    wcsStatus = 0; fits_read_key(fptr, TDOUBLE, "CRVAL1", &crval1, nullptr, &wcsStatus);
+    wcsStatus = 0; fits_read_key(fptr, TDOUBLE, "CRVAL2", &crval2, nullptr, &wcsStatus);
+    wcsStatus = 0; fits_read_key(fptr, TDOUBLE, "CRPIX1", &crpix1, nullptr, &wcsStatus);
+    wcsStatus = 0; fits_read_key(fptr, TDOUBLE, "CRPIX2", &crpix2, nullptr, &wcsStatus);
+    wcsStatus = 0; fits_read_key(fptr, TDOUBLE, "CD1_1", &cd1_1, nullptr, &wcsStatus);
+    wcsStatus = 0; fits_read_key(fptr, TDOUBLE, "CD1_2", &cd1_2, nullptr, &wcsStatus);
+    wcsStatus = 0; fits_read_key(fptr, TDOUBLE, "CD2_1", &cd2_1, nullptr, &wcsStatus);
+    wcsStatus = 0; fits_read_key(fptr, TDOUBLE, "CD2_2", &cd2_2, nullptr, &wcsStatus);
+    wcsStatus = 0; fits_read_key(fptr, TSTRING, "CTYPE1", ctype1, nullptr, &wcsStatus);
+    wcsStatus = 0; fits_read_key(fptr, TSTRING, "CTYPE2", ctype2, nullptr, &wcsStatus);
+
+    data.crval1 = crval1;
+    data.crval2 = crval2;
+    data.crpix1 = crpix1 - x0;
+    data.crpix2 = crpix2 - y0;
+    data.cd1_1 = cd1_1;
+    data.cd1_2 = cd1_2;
+    data.cd2_1 = cd2_1;
+    data.cd2_2 = cd2_2;
+    data.ctype1 = std::string(ctype1);
+    data.ctype2 = std::string(ctype2);
+
+    if (data.cd1_1 == 0.0 && data.cd1_2 == 0.0 && data.cd2_1 == 0.0 && data.cd2_2 == 0.0) {
+        double cdelt1 = 0.0, cdelt2 = 0.0, crota2 = 0.0;
+        wcsStatus = 0; fits_read_key(fptr, TDOUBLE, "CDELT1", &cdelt1, nullptr, &wcsStatus);
+        wcsStatus = 0; fits_read_key(fptr, TDOUBLE, "CDELT2", &cdelt2, nullptr, &wcsStatus);
+        wcsStatus = 0; fits_read_key(fptr, TDOUBLE, "CROTA2", &crota2, nullptr, &wcsStatus);
+        if (wcsStatus != 0) {
+            wcsStatus = 0;
+            fits_read_key(fptr, TDOUBLE, "CROTA1", &crota2, nullptr, &wcsStatus);
+        }
+        if (cdelt1 != 0.0 && cdelt2 != 0.0) {
+            double crota_rad = crota2 * M_PI / 180.0;
+            data.cd1_1 = cdelt1 * cos(crota_rad);
+            data.cd1_2 = -cdelt2 * sin(crota_rad);
+            data.cd2_1 = cdelt1 * sin(crota_rad);
+            data.cd2_2 = cdelt2 * cos(crota_rad);
+        }
+    }
+
+    int bzeroStatus = 0;
+    fits_read_key(fptr, TDOUBLE, "BZERO", &data.bzero, nullptr, &bzeroStatus);
+    bzeroStatus = 0;
+    fits_read_key(fptr, TDOUBLE, "BSCALE", &data.bscale, nullptr, &bzeroStatus);
+    if (data.bscale == 0.0) data.bscale = 1.0;
+
+    status = 0;
+    long fpixel[3] = {static_cast<long>(x0 + 1), static_cast<long>(y0 + 1), 1};
+    long lpixel[3] = {static_cast<long>(x1), static_cast<long>(y1), static_cast<long>(depth)};
+    long inc[3] = {1, 1, 1};
+    long npixels = static_cast<long>(data.width) * data.height * data.depth;
+    std::vector<double> tempPixels(npixels);
+
+    if (fits_read_subset(fptr, TDOUBLE, fpixel, lpixel, inc, nullptr, tempPixels.data(), nullptr, &status)) {
+        fits_close_file(fptr, &status);
+        data.errorMessage = "Failed to read cutout image data";
+        data.isValid = false;
+        return data;
+    }
+
+    data.pixels.resize(npixels);
+    for (long i = 0; i < npixels; ++i) {
+        data.pixels[i] = static_cast<float>(tempPixels[i]);
+    }
+
+    if (data.bzero != 0.0 || data.bscale != 1.0) {
+        for (size_t i = 0; i < data.pixels.size(); ++i) {
+            data.pixels[i] = data.pixels[i] * data.bscale + data.bzero;
+        }
+    }
+
+    fits_close_file(fptr, &status);
+    data.isValid = true;
+    return data;
+#else
+    FitsData full = readFitsFileSimple(filename, hdu);
+    if (!full.isValid) {
+        return full;
+    }
+
+    const int x0 = std::max(0, bounds.x0);
+    const int y0 = std::max(0, bounds.y0);
+    const int x1 = std::min(full.width, bounds.x0 + bounds.width);
+    const int y1 = std::min(full.height, bounds.y0 + bounds.height);
+    if (x0 >= x1 || y0 >= y1) {
+        full.isValid = false;
+        full.errorMessage = "Cutout bounds outside image";
+        return full;
+    }
+
+    FitsData cutout = full;
+    cutout.width = x1 - x0;
+    cutout.height = y1 - y0;
+    cutout.crpix1 = full.crpix1 - x0;
+    cutout.crpix2 = full.crpix2 - y0;
+    cutout.pixels.assign(static_cast<size_t>(cutout.width) * cutout.height * cutout.depth, 0.0f);
+
+    for (int z = 0; z < cutout.depth; ++z) {
+        for (int y = 0; y < cutout.height; ++y) {
+            for (int x = 0; x < cutout.width; ++x) {
+                size_t srcIdx = (static_cast<size_t>(z) * full.height + (y0 + y)) * full.width + (x0 + x);
+                size_t dstIdx = (static_cast<size_t>(z) * cutout.height + y) * cutout.width + x;
+                cutout.pixels[dstIdx] = full.pixels[srcIdx];
+            }
+        }
+    }
+    return cutout;
+#endif
 }
 
 /**

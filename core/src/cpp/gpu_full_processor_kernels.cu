@@ -148,7 +148,8 @@ __device__ double bilinearInterp_device(
  * Main kernel: Process all tiles with precomputed coordinates
  * Each thread handles one output pixel
  */
-__global__ void fullGPUTileKernelWithCoords(
+template <typename ResultT>
+__global__ void fullGPUTileKernelWithCoordsTyped(
     // Source images
     const float* __restrict__ allPixels,
     const size_t* __restrict__ imageOffsets,
@@ -168,32 +169,32 @@ __global__ void fullGPUTileKernelWithCoords(
     int tileWidth,
     int numTiles,
     // Output
-    double* __restrict__ results,
+    ResultT* __restrict__ results,
     double outputBlank
 ) {
     size_t globalIdx = blockIdx.x * blockDim.x + threadIdx.x;
-    
+
     int pixelsPerTile = tileWidth * tileWidth;
     size_t totalPixels = (size_t)numTiles * pixelsPerTile;
-    
+
     if (globalIdx >= totalPixels) return;
-    
+
     int tileIdx = globalIdx / pixelsPerTile;
-    
+
     // Get precomputed celestial coordinates
     double ra = raCoords[globalIdx];
     double dec = decCoords[globalIdx];
-    
+
     // WCS transform + interpolation + weighted coadd for each source image
     // Matches Java ThreadBuilderTile weighted average calculation
     double sumWeightedValue = 0.0;
     double totalCoef = 0.0;
-    
+
     for (int img = 0; img < numImages; img++) {
         if (imageMasks[tileIdx * numImages + img] == 0) {
             continue;
         }
-        
+
         double pixelX, pixelY;
         celestialToPixel_device(
             ra, dec,
@@ -203,17 +204,17 @@ __global__ void fullGPUTileKernelWithCoords(
             cd2_1[img], cd2_2[img],
             pixelX, pixelY
         );
-        
+
         // Y-flip and 0-based conversion (match Java)
         double adjustedY = pixelY - 1;  // Java-compatible: no Y-flip, just 0-based
         pixelX = pixelX - 1;
-        
+
         // Standard boundary check
         if (pixelX < -0.5 || pixelX >= widths[img] - 0.5 ||
             adjustedY < -0.5 || adjustedY >= heights[img] - 0.5) {
             continue;
         }
-        
+
         const float* imgPixels = allPixels + imageOffsets[img];
         double value = bilinearInterp_device(
             imgPixels,
@@ -221,42 +222,73 @@ __global__ void fullGPUTileKernelWithCoords(
             pixelX, adjustedY,
             blanks[img]
         );
-        
+
         if (!isBlank_device((float)value, blanks[img])) {
-            // Calculate coefficient (matches Java getCoef for overlayMean mode)
-            // Boundary coefficient reduction: divide by 2 at edges, by 4 at corners
             double coef = 1.0;
             int x1 = (int)pixelX;
             int y1 = (int)adjustedY;
             int w = widths[img];
             int h = heights[img];
-            
-            // Check if on boundary lines (Java: xCell/yCell boundaries)
-            // Simplified: reduce coefficient at image edges
+
             if (x1 > 0 && x1 < w - 1 && (pixelX <= 0.5 || pixelX >= w - 1.5)) {
                 coef *= 0.5;
             }
             if (y1 > 0 && y1 < h - 1 && (adjustedY <= 0.5 || adjustedY >= h - 1.5)) {
                 coef *= 0.5;
             }
-            
+
             totalCoef += coef;
             sumWeightedValue += value * coef;
         }
     }
-    
-    // Weighted average (matches Java: pixelFinal += (pixval[i]*pixcoef[i])/totalCoef)
+
     if (totalCoef > 0) {
-        results[globalIdx] = sumWeightedValue / totalCoef;
+        results[globalIdx] = static_cast<ResultT>(sumWeightedValue / totalCoef);
     } else {
-        results[globalIdx] = outputBlank;
+        results[globalIdx] = static_cast<ResultT>(outputBlank);
     }
 }
 
-/**
- * Kernel launcher with precomputed coordinates
- */
-extern "C" void launchFullGPUTileKernelWithCoords(
+extern "C" void launchFullGPUTileKernelWithCoordsFloat(
+    const float* d_allPixels,
+    const size_t* d_imageOffsets,
+    const double* d_crval1, const double* d_crval2,
+    const double* d_crpix1, const double* d_crpix2,
+    const double* d_cd1_1, const double* d_cd1_2,
+    const double* d_cd2_1, const double* d_cd2_2,
+    const int* d_widths, const int* d_heights,
+    const float* d_blanks,
+    int numImages,
+    const double* d_raCoords,
+    const double* d_decCoords,
+    const int* d_imageMasks,
+    int tileWidth,
+    int numTiles,
+    float* d_results,
+    double outputBlank
+) {
+    int pixelsPerTile = tileWidth * tileWidth;
+    size_t totalPixels = (size_t)numTiles * pixelsPerTile;
+
+    int blockSize = 256;
+    int numBlocks = (totalPixels + blockSize - 1) / blockSize;
+
+    fullGPUTileKernelWithCoordsTyped<float><<<numBlocks, blockSize>>>(
+        d_allPixels, d_imageOffsets,
+        d_crval1, d_crval2,
+        d_crpix1, d_crpix2,
+        d_cd1_1, d_cd1_2,
+        d_cd2_1, d_cd2_2,
+        d_widths, d_heights, d_blanks,
+        numImages,
+        d_raCoords, d_decCoords,
+        d_imageMasks,
+        tileWidth, numTiles,
+        d_results, outputBlank
+    );
+}
+
+extern "C" void launchFullGPUTileKernelWithCoordsDouble(
     const float* d_allPixels,
     const size_t* d_imageOffsets,
     const double* d_crval1, const double* d_crval2,
@@ -276,11 +308,11 @@ extern "C" void launchFullGPUTileKernelWithCoords(
 ) {
     int pixelsPerTile = tileWidth * tileWidth;
     size_t totalPixels = (size_t)numTiles * pixelsPerTile;
-    
+
     int blockSize = 256;
     int numBlocks = (totalPixels + blockSize - 1) / blockSize;
-    
-    fullGPUTileKernelWithCoords<<<numBlocks, blockSize>>>(
+
+    fullGPUTileKernelWithCoordsTyped<double><<<numBlocks, blockSize>>>(
         d_allPixels, d_imageOffsets,
         d_crval1, d_crval2,
         d_crpix1, d_crpix2,
@@ -290,6 +322,366 @@ extern "C" void launchFullGPUTileKernelWithCoords(
         numImages,
         d_raCoords, d_decCoords,
         d_imageMasks,
+        tileWidth, numTiles,
+        d_results, outputBlank
+    );
+}
+
+extern "C" void launchFullGPUTileKernelWithCoords(
+    const float* d_allPixels,
+    const size_t* d_imageOffsets,
+    const double* d_crval1, const double* d_crval2,
+    const double* d_crpix1, const double* d_crpix2,
+    const double* d_cd1_1, const double* d_cd1_2,
+    const double* d_cd2_1, const double* d_cd2_2,
+    const int* d_widths, const int* d_heights,
+    const float* d_blanks,
+    int numImages,
+    const double* d_raCoords,
+    const double* d_decCoords,
+    const int* d_imageMasks,
+    int tileWidth,
+    int numTiles,
+    double* d_results,
+    double outputBlank
+) {
+    launchFullGPUTileKernelWithCoordsDouble(
+        d_allPixels, d_imageOffsets,
+        d_crval1, d_crval2,
+        d_crpix1, d_crpix2,
+        d_cd1_1, d_cd1_2,
+        d_cd2_1, d_cd2_2,
+        d_widths, d_heights, d_blanks,
+        numImages,
+        d_raCoords, d_decCoords,
+        d_imageMasks,
+        tileWidth, numTiles,
+        d_results, outputBlank
+    );
+}
+
+extern "C" void launchFullGPUTileKernelWithCoordsSparseFloat(
+    const float* d_allPixels,
+    const size_t* d_imageOffsets,
+    const double* d_crval1, const double* d_crval2,
+    const double* d_crpix1, const double* d_crpix2,
+    const double* d_cd1_1, const double* d_cd1_2,
+    const double* d_cd2_1, const double* d_cd2_2,
+    const int* d_widths, const int* d_heights,
+    const float* d_blanks,
+    const double* d_raCoords,
+    const double* d_decCoords,
+    const int* d_tileImageOffsets,
+    const int* d_tileImageIndices,
+    int tileWidth,
+    int numTiles,
+    float* d_results,
+    double outputBlank
+);
+
+
+extern "C" void launchFullGPUTileKernelWithCoordsSparseAccum(
+    const float* d_allPixels,
+    const size_t* d_imageOffsets,
+    const double* d_crval1, const double* d_crval2,
+    const double* d_crpix1, const double* d_crpix2,
+    const double* d_cd1_1, const double* d_cd1_2,
+    const double* d_cd2_1, const double* d_cd2_2,
+    const int* d_widths, const int* d_heights,
+    const float* d_blanks,
+    const double* d_raCoords,
+    const double* d_decCoords,
+    const int* d_tileImageOffsets,
+    const int* d_tileImageIndices,
+    int tileWidth,
+    int numTiles,
+    double* d_weightedSums,
+    double* d_totalWeights
+);
+
+template <typename ResultT>
+__global__ void fullGPUTileKernelWithCoordsSparseTyped(
+    const float* __restrict__ allPixels,
+    const size_t* __restrict__ imageOffsets,
+    const double* __restrict__ crval1, const double* __restrict__ crval2,
+    const double* __restrict__ crpix1, const double* __restrict__ crpix2,
+    const double* __restrict__ cd1_1, const double* __restrict__ cd1_2,
+    const double* __restrict__ cd2_1, const double* __restrict__ cd2_2,
+    const int* __restrict__ widths, const int* __restrict__ heights,
+    const float* __restrict__ blanks,
+    const double* __restrict__ raCoords,
+    const double* __restrict__ decCoords,
+    const int* __restrict__ tileImageOffsets,
+    const int* __restrict__ tileImageIndices,
+    int tileWidth,
+    int numTiles,
+    ResultT* __restrict__ results,
+    double outputBlank
+) {
+    size_t globalIdx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    const int pixelsPerTile = tileWidth * tileWidth;
+    const size_t totalPixels = (size_t)numTiles * pixelsPerTile;
+    if (globalIdx >= totalPixels) return;
+
+    const int tileIdx = globalIdx / pixelsPerTile;
+    const int tileStart = tileImageOffsets[tileIdx];
+    const int tileEnd = tileImageOffsets[tileIdx + 1];
+
+    const double ra = raCoords[globalIdx];
+    const double dec = decCoords[globalIdx];
+
+    double sumWeightedValue = 0.0;
+    double totalCoef = 0.0;
+
+    for (int refIdx = tileStart; refIdx < tileEnd; ++refIdx) {
+        const int img = tileImageIndices[refIdx];
+
+        double pixelX, pixelY;
+        celestialToPixel_device(
+            ra, dec,
+            crval1[img], crval2[img],
+            crpix1[img], crpix2[img],
+            cd1_1[img], cd1_2[img],
+            cd2_1[img], cd2_2[img],
+            pixelX, pixelY
+        );
+
+        double adjustedY = pixelY - 1;
+        pixelX = pixelX - 1;
+
+        if (pixelX < -0.5 || pixelX >= widths[img] - 0.5 ||
+            adjustedY < -0.5 || adjustedY >= heights[img] - 0.5) {
+            continue;
+        }
+
+        const float* imgPixels = allPixels + imageOffsets[img];
+        const double value = bilinearInterp_device(
+            imgPixels,
+            widths[img], heights[img],
+            pixelX, adjustedY,
+            blanks[img]
+        );
+
+        if (!isBlank_device((float)value, blanks[img])) {
+            double coef = 1.0;
+            const int x1 = (int)pixelX;
+            const int y1 = (int)adjustedY;
+            const int w = widths[img];
+            const int h = heights[img];
+
+            if (x1 > 0 && x1 < w - 1 && (pixelX <= 0.5 || pixelX >= w - 1.5)) {
+                coef *= 0.5;
+            }
+            if (y1 > 0 && y1 < h - 1 && (adjustedY <= 0.5 || adjustedY >= h - 1.5)) {
+                coef *= 0.5;
+            }
+
+            totalCoef += coef;
+            sumWeightedValue += value * coef;
+        }
+    }
+
+    if (totalCoef > 0) {
+        results[globalIdx] = static_cast<ResultT>(sumWeightedValue / totalCoef);
+    } else {
+        results[globalIdx] = static_cast<ResultT>(outputBlank);
+    }
+}
+
+
+__global__ void fullGPUTileKernelWithCoordsSparseAccumKernel(
+    const float* __restrict__ allPixels,
+    const size_t* __restrict__ imageOffsets,
+    const double* __restrict__ crval1, const double* __restrict__ crval2,
+    const double* __restrict__ crpix1, const double* __restrict__ crpix2,
+    const double* __restrict__ cd1_1, const double* __restrict__ cd1_2,
+    const double* __restrict__ cd2_1, const double* __restrict__ cd2_2,
+    const int* __restrict__ widths, const int* __restrict__ heights,
+    const float* __restrict__ blanks,
+    const double* __restrict__ raCoords,
+    const double* __restrict__ decCoords,
+    const int* __restrict__ tileImageOffsets,
+    const int* __restrict__ tileImageIndices,
+    int tileWidth,
+    int numTiles,
+    double* __restrict__ weightedSums,
+    double* __restrict__ totalWeights
+) {
+    size_t globalIdx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    const int pixelsPerTile = tileWidth * tileWidth;
+    const size_t totalPixels = (size_t)numTiles * pixelsPerTile;
+    if (globalIdx >= totalPixels) return;
+
+    const int tileIdx = globalIdx / pixelsPerTile;
+    const int tileStart = tileImageOffsets[tileIdx];
+    const int tileEnd = tileImageOffsets[tileIdx + 1];
+
+    const double ra = raCoords[globalIdx];
+    const double dec = decCoords[globalIdx];
+
+    double sumWeightedValue = 0.0;
+    double totalCoef = 0.0;
+
+    for (int refIdx = tileStart; refIdx < tileEnd; ++refIdx) {
+        const int img = tileImageIndices[refIdx];
+
+        double pixelX, pixelY;
+        celestialToPixel_device(
+            ra, dec,
+            crval1[img], crval2[img],
+            crpix1[img], crpix2[img],
+            cd1_1[img], cd1_2[img],
+            cd2_1[img], cd2_2[img],
+            pixelX, pixelY
+        );
+
+        double adjustedY = pixelY - 1;
+        pixelX = pixelX - 1;
+
+        if (pixelX < -0.5 || pixelX >= widths[img] - 0.5 ||
+            adjustedY < -0.5 || adjustedY >= heights[img] - 0.5) {
+            continue;
+        }
+
+        const float* imgPixels = allPixels + imageOffsets[img];
+        const double value = bilinearInterp_device(
+            imgPixels,
+            widths[img], heights[img],
+            pixelX, adjustedY,
+            blanks[img]
+        );
+
+        if (!isBlank_device((float)value, blanks[img])) {
+            double coef = 1.0;
+            const int x1 = (int)pixelX;
+            const int y1 = (int)adjustedY;
+            const int w = widths[img];
+            const int h = heights[img];
+
+            if (x1 > 0 && x1 < w - 1 && (pixelX <= 0.5 || pixelX >= w - 1.5)) {
+                coef *= 0.5;
+            }
+            if (y1 > 0 && y1 < h - 1 && (adjustedY <= 0.5 || adjustedY >= h - 1.5)) {
+                coef *= 0.5;
+            }
+
+            totalCoef += coef;
+            sumWeightedValue += value * coef;
+        }
+    }
+
+    weightedSums[globalIdx] = sumWeightedValue;
+    totalWeights[globalIdx] = totalCoef;
+}
+
+extern "C" void launchFullGPUTileKernelWithCoordsSparseAccum(
+    const float* d_allPixels,
+    const size_t* d_imageOffsets,
+    const double* d_crval1, const double* d_crval2,
+    const double* d_crpix1, const double* d_crpix2,
+    const double* d_cd1_1, const double* d_cd1_2,
+    const double* d_cd2_1, const double* d_cd2_2,
+    const int* d_widths, const int* d_heights,
+    const float* d_blanks,
+    const double* d_raCoords,
+    const double* d_decCoords,
+    const int* d_tileImageOffsets,
+    const int* d_tileImageIndices,
+    int tileWidth,
+    int numTiles,
+    double* d_weightedSums,
+    double* d_totalWeights
+) {
+    const int pixelsPerTile = tileWidth * tileWidth;
+    const size_t totalPixels = (size_t)numTiles * pixelsPerTile;
+    const int blockSize = 256;
+    const int numBlocks = (totalPixels + blockSize - 1) / blockSize;
+
+    fullGPUTileKernelWithCoordsSparseAccumKernel<<<numBlocks, blockSize>>>(
+        d_allPixels, d_imageOffsets,
+        d_crval1, d_crval2,
+        d_crpix1, d_crpix2,
+        d_cd1_1, d_cd1_2,
+        d_cd2_1, d_cd2_2,
+        d_widths, d_heights, d_blanks,
+        d_raCoords, d_decCoords,
+        d_tileImageOffsets, d_tileImageIndices,
+        tileWidth, numTiles,
+        d_weightedSums, d_totalWeights
+    );
+}
+
+extern "C" void launchFullGPUTileKernelWithCoordsSparseFloat(
+    const float* d_allPixels,
+    const size_t* d_imageOffsets,
+    const double* d_crval1, const double* d_crval2,
+    const double* d_crpix1, const double* d_crpix2,
+    const double* d_cd1_1, const double* d_cd1_2,
+    const double* d_cd2_1, const double* d_cd2_2,
+    const int* d_widths, const int* d_heights,
+    const float* d_blanks,
+    const double* d_raCoords,
+    const double* d_decCoords,
+    const int* d_tileImageOffsets,
+    const int* d_tileImageIndices,
+    int tileWidth,
+    int numTiles,
+    float* d_results,
+    double outputBlank
+) {
+    const int pixelsPerTile = tileWidth * tileWidth;
+    const size_t totalPixels = (size_t)numTiles * pixelsPerTile;
+    const int blockSize = 256;
+    const int numBlocks = (totalPixels + blockSize - 1) / blockSize;
+
+    fullGPUTileKernelWithCoordsSparseTyped<float><<<numBlocks, blockSize>>>(
+        d_allPixels, d_imageOffsets,
+        d_crval1, d_crval2,
+        d_crpix1, d_crpix2,
+        d_cd1_1, d_cd1_2,
+        d_cd2_1, d_cd2_2,
+        d_widths, d_heights, d_blanks,
+        d_raCoords, d_decCoords,
+        d_tileImageOffsets, d_tileImageIndices,
+        tileWidth, numTiles,
+        d_results, outputBlank
+    );
+}
+
+extern "C" void launchFullGPUTileKernelWithCoordsSparseDouble(
+    const float* d_allPixels,
+    const size_t* d_imageOffsets,
+    const double* d_crval1, const double* d_crval2,
+    const double* d_crpix1, const double* d_crpix2,
+    const double* d_cd1_1, const double* d_cd1_2,
+    const double* d_cd2_1, const double* d_cd2_2,
+    const int* d_widths, const int* d_heights,
+    const float* d_blanks,
+    const double* d_raCoords,
+    const double* d_decCoords,
+    const int* d_tileImageOffsets,
+    const int* d_tileImageIndices,
+    int tileWidth,
+    int numTiles,
+    double* d_results,
+    double outputBlank
+) {
+    const int pixelsPerTile = tileWidth * tileWidth;
+    const size_t totalPixels = (size_t)numTiles * pixelsPerTile;
+    const int blockSize = 256;
+    const int numBlocks = (totalPixels + blockSize - 1) / blockSize;
+
+    fullGPUTileKernelWithCoordsSparseTyped<double><<<numBlocks, blockSize>>>(
+        d_allPixels, d_imageOffsets,
+        d_crval1, d_crval2,
+        d_crpix1, d_crpix2,
+        d_cd1_1, d_cd1_2,
+        d_cd2_1, d_cd2_2,
+        d_widths, d_heights, d_blanks,
+        d_raCoords, d_decCoords,
+        d_tileImageOffsets, d_tileImageIndices,
         tileWidth, numTiles,
         d_results, outputBlank
     );

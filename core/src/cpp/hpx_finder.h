@@ -47,7 +47,23 @@ public:
      */
     static bool generateIndex(const std::string& inputDir, 
                               const std::string& outputDir, 
-                              int orderMax);
+                              int orderMax,
+                              const std::string& sourceRootDir = "");
+    
+    /**
+     * 追加新批次数据到已有HpxFinder，并返回需要重建的最高阶dirty tiles
+     *
+     * @param inputDir 新批次输入目录（只包含需要追加的FITS）
+     * @param outputDir 现有HiPS输出目录
+     * @param orderMax 最高HEALPix order
+     * @param sourceRootDir 用于存储/解析相对路径的源数据根目录
+     * @param dirtyOrderMaxTiles 返回发生变化的orderMax tile索引
+     */
+    static bool appendIndex(const std::string& inputDir,
+                            const std::string& outputDir,
+                            int orderMax,
+                            const std::string& sourceRootDir = "",
+                            std::vector<long>* dirtyOrderMaxTiles = nullptr);
     
     /**
      * 查询HpxFinder索引，获取覆盖指定HEALPix tile的源文件列表

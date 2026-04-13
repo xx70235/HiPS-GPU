@@ -10,6 +10,14 @@
 #include <vector>
 #include <limits>
 
+// 像素边界框（0-based，左上角起始）
+struct PixelBounds {
+    int x0 = 0;
+    int y0 = 0;
+    int width = 0;
+    int height = 0;
+};
+
 // FITS文件数据结构
 struct FitsData {
     std::string filename;
@@ -89,6 +97,14 @@ public:
      * @return FitsData结构，包含所有读取的数据
      */
     static FitsData readFitsFile(const std::string& filename, int hdu = 0);
+
+    /**
+     * 读取FITS子区域（cutout）
+     * @param filename FITS文件路径
+     * @param bounds 子区域边界（0-based）
+     * @param hdu HDU编号（默认为0）
+     */
+    static FitsData readFitsCutout(const std::string& filename, const PixelBounds& bounds, int hdu = 0);
     
     /**
      * 使用CFITSIO库读取FITS文件（如果可用）

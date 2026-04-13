@@ -3,7 +3,10 @@
 
 #include <string>
 #include <vector>
+#include <cmath>
 #include <fitsio.h>
+
+#include "fits_hdu_utils.h"
 
 /**
  * 快速FITS头读取器 - 只读取WCS信息，不读取像素数据
@@ -16,6 +19,8 @@ struct WCSInfo {
     double cd2_1 = 0, cd2_2 = 0;
     int width = 0, height = 0;       // 图像尺寸
     bool valid = false;
+    int selected_hdu_1_based = 0;
+    std::string error;
 };
 
 class FastFitsHeaderReader {
@@ -34,25 +39,22 @@ public:
             return info;
         }
         
-        // 对于.fz压缩文件，移动到HDU 2
-        std::string ext = filename.substr(filename.find_last_of(".") + 1);
-        if (ext == "fz") {
-            int hdutype;
-            fits_movabs_hdu(fptr, 2, &hdutype, &status);
-            if (status) {
-                status = 0;
-                fits_movabs_hdu(fptr, 1, &hdutype, &status);
-            }
+        HduSelectionResult selection = select_valid_image_hdu(fptr, filename, 0);
+        if (!selection.found) {
+            info.error = selection.error;
+            fits_close_file(fptr, &status);
+            return info;
         }
-        
-        // 读取图像尺寸
-        long naxes[2] = {0, 0};
-        int naxis = 0;
-        fits_get_img_dim(fptr, &naxis, &status);
-        if (naxis >= 2) {
-            fits_get_img_size(fptr, 2, naxes, &status);
-            info.width = naxes[0];
-            info.height = naxes[1];
+        info.selected_hdu_1_based = selection.hdu_index_1_based;
+        info.width = static_cast<int>(selection.width);
+        info.height = static_cast<int>(selection.height);
+
+        int hdutype = 0;
+        status = 0;
+        if (fits_movabs_hdu(fptr, selection.hdu_index_1_based, &hdutype, &status)) {
+            info.error = "Failed to move to selected HDU";
+            fits_close_file(fptr, &status);
+            return info;
         }
         
         // 读取WCS关键字

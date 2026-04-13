@@ -22,6 +22,11 @@
 #include <random>
 #include <map>
 #include <limits>
+#include <set>
+
+#include <omp.h>
+#include <healpix_cxx/healpix_base.h>
+#include <healpix_cxx/pointing.h>
 
 // CUDA includes
 #include <cuda_runtime.h>
@@ -30,6 +35,8 @@
 
 // HiPS modules
 #include "fits_io.h"
+#include "fits_header_reader.h"
+#include "cutout_planner.h"
 #include "coordinate_transform.h"
 #include "healpix_util.h"
 #include "hpx_finder.h"
@@ -41,6 +48,8 @@
 #include "gpu_batch_processor.h"
 #include "gpu_full_processor.h"
 #include "async_writer.h"
+#include "parallel_utils.h"
+#include "pipeline_policy.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -51,7 +60,276 @@
 #include <unistd.h>
 #endif
 
+
 namespace fs = std::filesystem;
+
+struct SourceReferenceMeta {
+    std::string sourceKey;
+    std::string fullPath;
+    FitsData wcsOnly;
+};
+
+struct TileCutoutRequest {
+    int sourceIndex = -1;
+    PixelBounds bounds;
+};
+
+static std::string normalizeRelativePath(const std::string& path) {
+    std::string normalized = path;
+    std::replace(normalized.begin(), normalized.end(), '\\', '/');
+    return normalized;
+}
+
+static std::string basenameFromPath(const std::string& path) {
+    size_t pos = path.find_last_of("/\\");
+    if (pos == std::string::npos) {
+        return path;
+    }
+    return path.substr(pos + 1);
+}
+
+static FitsData makeMetadataFitsData(const std::string& filename, const WCSInfo& wcs) {
+    FitsData data;
+    data.filename = filename;
+    data.width = wcs.width;
+    data.height = wcs.height;
+    data.depth = 1;
+    data.crval1 = wcs.crval1;
+    data.crval2 = wcs.crval2;
+    data.crpix1 = wcs.crpix1;
+    data.crpix2 = wcs.crpix2;
+    data.cd1_1 = wcs.cd1_1;
+    data.cd1_2 = wcs.cd1_2;
+    data.cd2_1 = wcs.cd2_1;
+    data.cd2_2 = wcs.cd2_2;
+    data.blank = std::numeric_limits<double>::quiet_NaN();
+    data.isValid = wcs.valid;
+    return data;
+}
+
+static std::vector<CelestialCoord> sampleTileCelestialCoords(
+    int order,
+    long npix,
+    int tileWidth,
+    const std::vector<int>& xy2hpx
+) {
+    std::vector<CelestialCoord> samples;
+    samples.reserve(9);
+
+    int tileOrder = 0;
+    int temp = tileWidth;
+    while (temp > 1) {
+        temp >>= 1;
+        tileOrder++;
+    }
+
+    int pixelOrder = order + tileOrder;
+    long nside = 1L << pixelOrder;
+    T_Healpix_Base<int64> hpx(nside, NEST, SET_NSIDE);
+    long baseIdx = npix << (2 * tileOrder);
+
+    auto addSample = [&](int x, int y) {
+        if (x < 0 || y < 0 || x >= tileWidth || y >= tileWidth) {
+            return;
+        }
+        int pixelInTile = y * tileWidth + x;
+        if (pixelInTile < 0 || pixelInTile >= static_cast<int>(xy2hpx.size())) {
+            return;
+        }
+        long healpixIdx = baseIdx + xy2hpx[pixelInTile];
+        pointing ptg = hpx.pix2ang(healpixIdx);
+        double dec = 90.0 - ptg.theta * 180.0 / M_PI;
+        double ra = ptg.phi * 180.0 / M_PI;
+        samples.emplace_back(ra, dec);
+    };
+
+    int maxIdx = tileWidth - 1;
+    int midIdx = tileWidth / 2;
+    addSample(0, 0);
+    addSample(maxIdx, 0);
+    addSample(0, maxIdx);
+    addSample(maxIdx, maxIdx);
+    addSample(midIdx, 0);
+    addSample(midIdx, maxIdx);
+    addSample(0, midIdx);
+    addSample(maxIdx, midIdx);
+    addSample(midIdx, midIdx);
+    return samples;
+}
+
+static bool estimateTileImageCutoutBounds(
+    const FitsData& imageMeta,
+    const std::vector<CelestialCoord>& tileSamples,
+    int padding,
+    PixelBounds& bounds
+) {
+    if (!imageMeta.isValid || imageMeta.width <= 0 || imageMeta.height <= 0 || tileSamples.empty()) {
+        return false;
+    }
+
+    CoordinateTransform transform(imageMeta);
+    double minX = std::numeric_limits<double>::infinity();
+    double minY = std::numeric_limits<double>::infinity();
+    double maxX = -std::numeric_limits<double>::infinity();
+    double maxY = -std::numeric_limits<double>::infinity();
+    int validSamples = 0;
+
+    for (const auto& celestial : tileSamples) {
+        Coord pixel = transform.celestialToPixel(celestial);
+        if (!std::isfinite(pixel.x) || !std::isfinite(pixel.y)) {
+            continue;
+        }
+        if (std::abs(pixel.x) > imageMeta.width * 32.0 || std::abs(pixel.y) > imageMeta.height * 32.0) {
+            continue;
+        }
+        minX = std::min(minX, pixel.x);
+        minY = std::min(minY, pixel.y);
+        maxX = std::max(maxX, pixel.x);
+        maxY = std::max(maxY, pixel.y);
+        validSamples++;
+    }
+
+    if (validSamples == 0) {
+        return false;
+    }
+
+    int x0 = static_cast<int>(std::floor(minX)) - padding;
+    int y0 = static_cast<int>(std::floor(minY)) - padding;
+    int x1 = static_cast<int>(std::ceil(maxX)) + padding + 1;
+    int y1 = static_cast<int>(std::ceil(maxY)) + padding + 1;
+
+    x0 = std::max(0, x0);
+    y0 = std::max(0, y0);
+    x1 = std::min(imageMeta.width, x1);
+    y1 = std::min(imageMeta.height, y1);
+
+    if (x0 >= x1 || y0 >= y1) {
+        bounds.x0 = 0;
+        bounds.y0 = 0;
+        bounds.width = 0;
+        bounds.height = 0;
+        return true;
+    }
+
+    bounds.x0 = x0;
+    bounds.y0 = y0;
+    bounds.width = x1 - x0;
+    bounds.height = y1 - y0;
+    return true;
+}
+
+static int choosePartitionSize(const FitsData& imageMeta, int defaultPartitionSize) {
+    int maxDim = std::max(imageMeta.width, imageMeta.height);
+    if (maxDim <= 0) {
+        return 0;
+    }
+    return std::min(defaultPartitionSize, maxDim);
+}
+
+static std::string buildAccumulatorCacheTilePath(
+    const std::string& outputDir,
+    const std::string& cacheName,
+    int order,
+    long npix
+) {
+    int dir = HealpixUtil::getDirNumber(npix);
+    std::ostringstream oss;
+    oss << outputDir << "/.hips_gpu_cache/" << cacheName
+        << "/Norder" << order << "/Dir" << dir << "/Npix" << npix << ".fits";
+    return oss.str();
+}
+
+static bool readAccumulatorCacheTile(
+    const std::string& outputDir,
+    const std::string& cacheName,
+    int order,
+    long npix,
+    int tileWidth,
+    std::vector<double>& values
+) {
+    std::string cachePath = buildAccumulatorCacheTilePath(outputDir, cacheName, order, npix);
+    if (!fs::exists(cachePath)) {
+        return false;
+    }
+
+#ifdef USE_CFITSIO
+    fitsfile* fptr = nullptr;
+    int status = 0;
+    if (fits_open_file(&fptr, cachePath.c_str(), READONLY, &status)) {
+        return false;
+    }
+
+    long naxes[2] = {0, 0};
+    int naxis = 0;
+    fits_get_img_dim(fptr, &naxis, &status);
+    fits_get_img_size(fptr, 2, naxes, &status);
+    if (status != 0 || naxis < 2 || naxes[0] != tileWidth || naxes[1] != tileWidth) {
+        fits_close_file(fptr, &status);
+        return false;
+    }
+
+    long fpixel[2] = {1, 1};
+    long nelements = naxes[0] * naxes[1];
+    values.resize((size_t)nelements);
+    if (fits_read_pix(fptr, TDOUBLE, fpixel, nelements, nullptr, values.data(), nullptr, &status)) {
+        fits_close_file(fptr, &status);
+        return false;
+    }
+
+    fits_close_file(fptr, &status);
+    return status == 0;
+#else
+    (void)cachePath;
+    (void)tileWidth;
+    values.clear();
+    return false;
+#endif
+}
+
+static bool writeAccumulatorCacheTile(
+    const std::string& outputDir,
+    const std::string& cacheName,
+    int order,
+    long npix,
+    int tileWidth,
+    const std::vector<double>& values,
+    const std::string& frame
+) {
+    (void)frame;
+    std::string cachePath = buildAccumulatorCacheTilePath(outputDir, cacheName, order, npix);
+    fs::create_directories(fs::path(cachePath).parent_path());
+
+#ifdef USE_CFITSIO
+    fitsfile* fptr = nullptr;
+    int status = 0;
+    std::string createPath = "!" + cachePath;
+    if (fits_create_file(&fptr, createPath.c_str(), &status)) {
+        return false;
+    }
+
+    long naxes[2] = {tileWidth, tileWidth};
+    if (fits_create_img(fptr, DOUBLE_IMG, 2, naxes, &status)) {
+        fits_close_file(fptr, &status);
+        return false;
+    }
+
+    long fpixel[2] = {1, 1};
+    long nelements = naxes[0] * naxes[1];
+    if (fits_write_pix(fptr, TDOUBLE, fpixel, nelements, const_cast<double*>(values.data()), &status)) {
+        fits_close_file(fptr, &status);
+        return false;
+    }
+
+    fits_close_file(fptr, &status);
+    return status == 0;
+#else
+    (void)cachePath;
+    (void)tileWidth;
+    (void)values;
+    return false;
+#endif
+}
+
 
 // Overlay modes (matching Java ModeOverlay)
 enum class OverlayMode {
@@ -115,6 +393,11 @@ struct Config {
     std::string resumeFile = ""; // 断点续传文件路径
     int progressInterval = 100;  // 进度报告间隔（文件数）
     std::string filePattern = "";  // 文件名过滤模式（支持通配符，如 "*-image-r.fits.fz"）
+    bool appendMode = false;       // 仅追加新批次并重建dirty orderMax tiles
+    bool enableTreeRebuild = false; // 显式启用lower-order TREE重建
+    bool enableCoordCache = false;  // 显式启用坐标磁盘缓存（默认关闭）
+    std::string sourceRootDir;     // 用于解析HpxFinder相对路径的源数据根目录
+    std::vector<long> dirtyOrderMaxTiles;
 };
 
 
@@ -679,29 +962,32 @@ bool parseArguments(int argc, char* argv[], Config& config) {
         std::cout << "  -sampleRatio <r>: Sample ratio for auto estimation (default: 0.1 = 10%)" << std::endl;
         std::cout << "  -no-index       : Skip INDEX stage" << std::endl;
         std::cout << "  -no-tiles       : Skip TILES stage" << std::endl;
+        std::cout << "  -append         : Append new FITS into existing HpxFinder and rebuild dirty orderMax tiles" << std::endl;
+        std::cout << "  -tree           : Enable lower-order TREE rebuild after orderMax tile generation" << std::endl;
+        std::cout << "  -coord-cache    : Enable disk-backed celestial coordinate cache" << std::endl;
+        std::cout << "  -source-root <dir> : Root used to store and resolve source-relative paths (default: input_dir)" << std::endl;
         std::cout << "  -v              : Verbose output" << std::endl;
         std::cout << "  -cpu            : Force CPU mode" << std::endl;
         std::cout << "  -recursive, -r  : Recursively scan subdirectories" << std::endl;
         std::cout << "  -limit <n>      : Limit number of files to process (for testing)" << std::endl;
         std::cout << "  -cache <n>      : Max cached FITS files in memory (default: 100)" << std::endl;
         std::cout << "  -progress <n>   : Progress report interval in files (default: 100)" << std::endl;
-        std::cout << "  -pattern <glob> : Filter files by pattern (e.g., \*-image-r.fits.fz)" << std::endl;
+        std::cout << "  -pattern <glob> : Filter files by pattern (e.g., *-image-r.fits.fz)" << std::endl;
         std::cout << std::endl;
         std::cout << "Example:" << std::endl;
         std::cout << "  hipsgen_cuda data/subset hips_output -order 3 -img data/subset/ref.img -blank 0 -mode AVERAGE" << std::endl;
         return false;
     }
-    
+
     config.inputDir = argv[1];
     config.outputDir = argv[2];
-    
-    // Parse options
+
     for (int i = 3; i < argc; i++) {
         std::string arg = argv[i];
-        
+
         if (arg == "-order" && i + 1 < argc) {
             config.orderMax = std::stoi(argv[++i]);
-            config.autoOrder = false;  // 用户手动指定
+            config.autoOrder = false;
         } else if (arg == "-threads" && i + 1 < argc) {
             config.maxThreads = std::stoi(argv[++i]);
         } else if (arg == "-bitpix" && i + 1 < argc) {
@@ -719,7 +1005,6 @@ bool parseArguments(int argc, char* argv[], Config& config) {
             config.hasValidRange = true;
         } else if (arg == "-mode" && i + 1 < argc) {
             std::string mode = argv[++i];
-            // Convert to uppercase for comparison
             std::transform(mode.begin(), mode.end(), mode.begin(), ::toupper);
             if (mode == "NONE") {
                 config.overlayMode = OverlayMode::NONE;
@@ -741,6 +1026,14 @@ bool parseArguments(int argc, char* argv[], Config& config) {
             config.enableIndex = false;
         } else if (arg == "-no-tiles") {
             config.enableTiles = false;
+        } else if (arg == "-append") {
+            config.appendMode = true;
+        } else if (arg == "-tree") {
+            config.enableTreeRebuild = true;
+        } else if (arg == "-coord-cache") {
+            config.enableCoordCache = true;
+        } else if (arg == "-source-root" && i + 1 < argc) {
+            config.sourceRootDir = argv[++i];
         } else if (arg == "-v") {
             config.verbose = true;
         } else if (arg == "-cpu") {
@@ -757,9 +1050,11 @@ bool parseArguments(int argc, char* argv[], Config& config) {
             config.progressInterval = std::stoi(argv[++i]);
         } else if (arg == "-pattern" && i + 1 < argc) {
             config.filePattern = argv[++i];
+        } else {
+            std::cerr << "Warning: Unknown option '" << arg << "'" << std::endl;
         }
     }
-    
+
     return true;
 }
 
@@ -806,31 +1101,32 @@ bool initFromImgEtalon(Config& config) {
  */
 void createOutputDirectories(const Config& config) {
     fs::create_directories(config.outputDir);
-    
+
+    int outputOrderStart = compute_output_tile_order_start(config.appendMode, config.orderMax, config.enableTreeRebuild);
+
     // 创建Norder目录
-    for (int order = 0; order <= config.orderMax; order++) {
-        // 估算需要的Dir数量
+    for (int order = outputOrderStart; order <= config.orderMax; order++) {
         long nside = HealpixUtil::norderToNside(order);
         long totalPixels = HealpixUtil::getTotalPixelsFromNside(nside);
         int maxDir = (int)(totalPixels / 10000) + 1;
-        maxDir = (maxDir < 1000) ? maxDir : 1000;  // Limit to max 1000 Dir
-        
+        maxDir = (maxDir < 1000) ? maxDir : 1000;
+
         for (int dir = 0; dir < maxDir; dir++) {
             std::ostringstream oss;
             oss << config.outputDir << "/Norder" << order << "/Dir" << dir;
             fs::create_directories(oss.str());
         }
     }
-    
-    // 创建HpxFinder目录（INDEX阶段需要）
+
     if (config.enableIndex) {
         std::string hpxFinderPath = config.outputDir + "/HpxFinder";
-        for (int order = 0; order <= config.orderMax; order++) {
+        int indexOrderStart = config.appendMode ? config.orderMax : 0;
+        for (int order = indexOrderStart; order <= config.orderMax; order++) {
             long nside = HealpixUtil::norderToNside(order);
             long totalPixels = HealpixUtil::getTotalPixelsFromNside(nside);
             int maxDir = (int)(totalPixels / 100000) + 1;
             maxDir = (maxDir < 1000) ? maxDir : 1000;
-            
+
             for (int dir = 0; dir < maxDir; dir++) {
                 std::ostringstream oss;
                 oss << hpxFinderPath << "/Norder" << order << "/Dir" << dir;
@@ -840,31 +1136,80 @@ void createOutputDirectories(const Config& config) {
     }
 }
 
+static void generateAllskyPreview(const Config& config) {
+    std::cout << "\n=== Generating Allsky preview ===" << std::endl;
+    if (!AllskyGenerator::generateAllskyFits(config.outputDir, 3, 64)) {
+        std::cerr << "WARNING: Allsky generation failed (not critical)" << std::endl;
+    }
+}
+
+static void generatePropertiesMetadata(const Config& config) {
+    std::cout << "\n=== Generating properties metadata ===" << std::endl;
+    std::string title = fs::path(config.inputDir).filename().string();
+    if (title.empty()) {
+        title = "HiPS";
+    }
+
+    double pixelCutMin = config.hasValidRange ? config.validMin : -1.0;
+    double pixelCutMax = config.hasValidRange ? config.validMax : 1.0;
+
+    PropertiesGenerator::generateProperties(
+        config.outputDir,
+        title,
+        config.orderMax,
+        config.tileWidth,
+        config.bitpix,
+        (int)g_stats.generatedTiles,
+        pixelCutMin,
+        pixelCutMax
+    );
+    std::cout << "Properties file generated" << std::endl;
+}
+
 /**
  * INDEX阶段：生成HpxFinder索引
  */
-bool runIndexStage(const Config& config) {
+bool runIndexStage(Config& config) {
     std::cout << "\n=== INDEX阶段：生成HpxFinder索引 ===" << std::endl;
-    
+
     std::string hpxFinderPath = config.outputDir + "/HpxFinder";
-    
+    std::string sourceRootDir = config.sourceRootDir.empty() ? config.inputDir : config.sourceRootDir;
+
     std::cout << "输入目录: " << config.inputDir << std::endl;
     std::cout << "HpxFinder路径: " << hpxFinderPath << std::endl;
     std::cout << "最大order: " << config.orderMax << std::endl;
-    
-    // 生成索引
-    bool success = HpxFinder::generateIndex(
-        config.inputDir,
-        config.outputDir,
-        config.orderMax
-    );
-    
-    if (success) {
-        std::cout << "INDEX阶段完成" << std::endl;
+    std::cout << "源数据根目录: " << sourceRootDir << std::endl;
+
+    bool success = false;
+    if (config.appendMode) {
+        config.dirtyOrderMaxTiles.clear();
+        success = HpxFinder::appendIndex(
+            config.inputDir,
+            config.outputDir,
+            config.orderMax,
+            sourceRootDir,
+            &config.dirtyOrderMaxTiles
+        );
+        if (success) {
+            std::cout << "INDEX追加阶段完成，dirty orderMax tiles: "
+                      << config.dirtyOrderMaxTiles.size() << std::endl;
+        }
     } else {
+        success = HpxFinder::generateIndex(
+            config.inputDir,
+            config.outputDir,
+            config.orderMax,
+            sourceRootDir
+        );
+        if (success) {
+            std::cout << "INDEX阶段完成" << std::endl;
+        }
+    }
+
+    if (!success) {
         std::cerr << "ERROR: INDEX阶段失败" << std::endl;
     }
-    
+
     return success;
 }
 
@@ -1000,7 +1345,7 @@ bool runTilesStageGPU(const Config& config) {
     }
     
     // Scan HpxFinder directory to find existing index files
-    for (int order = 0; order <= config.orderMax; order++) {
+    for (int order = config.orderMax; order <= config.orderMax; order++) {
         std::string orderPath = hpxFinderPath + "/Norder" + std::to_string(order);
         
         if (!fs::exists(orderPath)) continue;
@@ -1123,215 +1468,507 @@ bool runTilesStageFullGPU(Config& config) {
     std::string hpxFinderPath = config.outputDir + "/HpxFinder";
     g_stats.reset();
     
-    // Step 1: Load all source FITS files
-    std::cout << "\nStep 1: Loading source FITS files..." << std::endl;
-    std::vector<FitsData> allFitsFiles;
-    
-    
-    
-    // Use new scanFitsFiles function
-    std::vector<std::string> filePaths = scanFitsFiles(config);
-    
-    int loadedCount = 0;
-    for (const auto& filePath : filePaths) {
-        // 使用缓存加载
-        FitsData* fitsPtr = getCachedFitsFile(filePath, config.verbose);
-        if (fitsPtr != nullptr && fitsPtr->isValid) {
-            allFitsFiles.push_back(*fitsPtr);
-            loadedCount++;
-            if (config.progressInterval > 0 && loadedCount % config.progressInterval == 0) {
-                std::cout << "  Loaded " << loadedCount << " files..." << std::endl;
+    // Step 1: Resolve referenced source images from HpxFinder before loading pixels
+    std::cout << "\nStep 1: Resolving referenced source images..." << std::endl;
+    const std::string sourceRootDir = config.sourceRootDir.empty() ? config.inputDir : config.sourceRootDir;
+    std::map<std::string, std::string> relativeToFullPath;
+    std::map<std::string, std::string> basenameToFullPath;
+    bool builtFallbackSourceScan = false;
+    size_t fallbackScannedFiles = 0;
+
+    auto buildFallbackSourceScan = [&]() {
+        if (builtFallbackSourceScan) {
+            return;
+        }
+        Config scanConfig = config;
+        scanConfig.inputDir = sourceRootDir;
+        scanConfig.recursiveScan = true;
+        std::vector<std::string> filePaths = scanFitsFiles(scanConfig);
+        for (const auto& filePath : filePaths) {
+            fs::path normalizedFile = fs::path(filePath).lexically_normal();
+            fs::path normalizedOutput = fs::path(config.outputDir).lexically_normal();
+            std::string outputPrefix = normalizedOutput.generic_string();
+            if (!outputPrefix.empty() && outputPrefix.back() != '/') {
+                outputPrefix += '/';
             }
-        } else if (config.skipErrors) {
-            if (config.verbose) {
-                std::cerr << "Skipping invalid file: " << filePath << std::endl;
+            std::string normalizedFileStr = normalizedFile.generic_string();
+            if (!outputPrefix.empty() &&
+                (normalizedFileStr == normalizedOutput.generic_string() ||
+                 normalizedFileStr.rfind(outputPrefix, 0) == 0)) {
+                continue;
+            }
+
+            fs::path relativePath = normalizedFile.lexically_relative(fs::path(sourceRootDir));
+            std::string relativeKey = relativePath.generic_string();
+            if (relativeKey.empty() || relativeKey == "." || relativeKey.rfind("../", 0) == 0) {
+                relativeKey.clear();
+            }
+            if (!relativeKey.empty()) {
+                relativeToFullPath[normalizeRelativePath(relativeKey)] = normalizedFileStr;
+            }
+            basenameToFullPath[basenameFromPath(normalizedFileStr)] = normalizedFileStr;
+            fallbackScannedFiles++;
+        }
+        builtFallbackSourceScan = true;
+    };
+
+    auto resolveSourcePath = [&](const std::string& sourceKey, const std::string& fallbackFilename) -> std::string {
+        if (!sourceKey.empty()) {
+            fs::path directPath(sourceKey);
+            if (directPath.is_absolute() && fs::exists(directPath)) {
+                return directPath.string();
+            }
+            fs::path rootedPath = fs::path(sourceRootDir) / sourceKey;
+            if (fs::exists(rootedPath)) {
+                return rootedPath.string();
             }
         }
-    }
-    
-    std::cout << "Loaded " << allFitsFiles.size() << " source images" << std::endl;
-    if (config.verbose) {
-        g_fitsCache.printStatus();
-    }
-    
-    // If user specified blank value, apply to all source images
-    if (config.hasUserBlank) {
-        for (auto& fits : allFitsFiles) {
-            fits.blank = config.blank;
+
+        buildFallbackSourceScan();
+
+        if (!sourceKey.empty()) {
+            auto relIt = relativeToFullPath.find(sourceKey);
+            if (relIt != relativeToFullPath.end()) {
+                return relIt->second;
+            }
         }
-        std::cout << "Applied user blank value " << config.blank << " to all source images" << std::endl;
-    }
-    
-    
-    // 自动估计validRange（如果用户请求）
-    if (config.autoValidRange && !config.hasValidRange) {
-        std::cout << "\n=== Auto-estimating validRange ===" << std::endl;
-        
-        // 收集所有FITS文件路径
-        std::vector<std::string> fitsFilePaths;
-        for (const auto& fits : allFitsFiles) {
-            fitsFilePaths.push_back(fits.filename);
+        if (!fallbackFilename.empty()) {
+            auto baseIt = basenameToFullPath.find(fallbackFilename);
+            if (baseIt != basenameToFullPath.end()) {
+                return baseIt->second;
+            }
         }
-        
-        ValidRangeEstimate estimate = estimateValidRange(
-            fitsFilePaths, 
-            config.blank, 
-            config.autoSampleRatio,
-            true  // verbose
-        );
-        
-        if (estimate.success) {
-            // 稍微扩展范围以避免边界问题（可选）
-            // double margin = (estimate.maxVal - estimate.minVal) * 0.01;
-            config.validMin = estimate.minVal;
-            config.validMax = estimate.maxVal;
-            config.hasValidRange = true;
-            
-            std::cout << "  Estimated validRange: [" << config.validMin 
-                      << ", " << config.validMax << "]" << std::endl;
-        } else {
-            std::cout << "  Warning: Could not estimate validRange, proceeding without filtering" << std::endl;
+        return "";
+    };
+
+    std::vector<GPUTileInfo> validTiles;
+    std::vector<SourceReferenceMeta> sourceRefs;
+    std::map<std::string, int> sourceKeyToIndex;
+
+    int tileWidth = config.tileWidth;
+    int pixelsPerTile = tileWidth * tileWidth;
+
+    auto appendIndexedTile = [&](int order, long npix, const std::string& indexPath) {
+        std::vector<SourceFileInfo> sourceFiles = HpxFinder::readIndexFile(indexPath);
+        if (sourceFiles.empty()) {
+            return;
+        }
+
+        GPUTileInfo info;
+        info.order = order;
+        info.npix = npix;
+
+        std::set<int> uniqueSourceIndices;
+        for (const auto& sf : sourceFiles) {
+            std::string sourceKey = normalizeRelativePath(sf.filepath.empty() ? sf.filename : sf.filepath);
+            std::string resolvedPath = resolveSourcePath(sourceKey, sf.filename);
+            if (resolvedPath.empty()) {
+                continue;
+            }
+
+            auto keyIt = sourceKeyToIndex.find(sourceKey);
+            if (keyIt == sourceKeyToIndex.end()) {
+                int newIndex = static_cast<int>(sourceRefs.size());
+                sourceRefs.push_back({sourceKey, resolvedPath, FitsData()});
+                sourceKeyToIndex[sourceKey] = newIndex;
+                keyIt = sourceKeyToIndex.find(sourceKey);
+            }
+
+            uniqueSourceIndices.insert(keyIt->second);
+        }
+
+        info.imageIndices.assign(uniqueSourceIndices.begin(), uniqueSourceIndices.end());
+        if (!info.imageIndices.empty()) {
+            validTiles.push_back(std::move(info));
+        }
+    };
+
+    if (config.appendMode) {
+        std::set<long> dirtyTileSet(config.dirtyOrderMaxTiles.begin(), config.dirtyOrderMaxTiles.end());
+        g_stats.totalTiles = dirtyTileSet.size();
+        std::cout << "Dirty orderMax tiles requested: " << dirtyTileSet.size() << std::endl;
+
+        for (long npix : dirtyTileSet) {
+            int dir = HealpixUtil::getDirNumber(npix);
+            std::ostringstream oss;
+            oss << hpxFinderPath << "/Norder" << config.orderMax << "/Dir" << dir << "/Npix" << npix;
+            appendIndexedTile(config.orderMax, npix, oss.str());
+        }
+    } else {
+        for (int order = 0; order <= config.orderMax; order++) {
+            long nside = HealpixUtil::norderToNside(order);
+            g_stats.totalTiles += HealpixUtil::getTotalPixelsFromNside(nside);
+        }
+
+        for (int order = config.orderMax; order <= config.orderMax; order++) {
+            std::string orderPath = hpxFinderPath + "/Norder" + std::to_string(order);
+            if (!fs::exists(orderPath)) continue;
+
+            for (const auto& dirEntry : fs::directory_iterator(orderPath)) {
+                if (!dirEntry.is_directory()) continue;
+
+                for (const auto& fileEntry : fs::directory_iterator(dirEntry.path())) {
+                    if (!fileEntry.is_regular_file()) continue;
+
+                    std::string filename = fileEntry.path().filename().string();
+                    if (filename.substr(0, 4) != "Npix") continue;
+
+                    long npix = std::stol(filename.substr(4));
+                    appendIndexedTile(order, npix, fileEntry.path().string());
+                }
+            }
         }
     }
 
-    // Apply validRange preprocessing - set pixels outside range to NaN (match Java CacheFits)
-    if (config.hasValidRange) {
-        int totalFiltered = 0;
-        for (auto& fits : allFitsFiles) {
-            int filtered = 0;
-            for (size_t i = 0; i < fits.pixels.size(); i++) {
-                float val = fits.pixels[i];
-                if (!std::isnan(val) && (val < config.validMin || val > config.validMax)) {
-                    fits.pixels[i] = std::numeric_limits<float>::quiet_NaN();
-                    filtered++;
-                }
-            }
-            totalFiltered += filtered;
-        }
-        std::cout << "Applied validRange [" << config.validMin << ", " << config.validMax 
-                  << "] - filtered " << totalFiltered << " pixels to NaN" << std::endl;
-    }
-    
-    // Create filename to index mapping for HpxFinder lookup
-    std::map<std::string, int> filenameToIndex;
-    for (size_t i = 0; i < allFitsFiles.size(); i++) {
-        // Extract just the filename from the full path
-        std::string filename = allFitsFiles[i].filename;
-        size_t pos = filename.find_last_of("/\\");
-        if (pos != std::string::npos) {
-            filename = filename.substr(pos + 1);
-        }
-        filenameToIndex[filename] = (int)i;
-    }
-    
-    // Debug: Print WCS parameters for first few images
-    if (config.verbose) {
-        std::cout << "\nWCS parameters for first 3 images:" << std::endl;
-        size_t maxDebug = allFitsFiles.size() < 3 ? allFitsFiles.size() : 3;
-        for (size_t i = 0; i < maxDebug; i++) {
-            const auto& f = allFitsFiles[i];
-            std::cout << "  Image " << i << " (" << f.filename << "): CRVAL=(" << f.crval1 << ", " << f.crval2 << ")"
-                      << ", CD=[[" << f.cd1_1 << ", " << f.cd1_2 << "], ["
-                      << f.cd2_1 << ", " << f.cd2_2 << "]]" << std::endl;
-        }
-    }
-    
-    if (allFitsFiles.empty()) {
-        std::cerr << "ERROR: No valid FITS files found" << std::endl;
-        return false;
-    }
-    
-    // Step 2: Initialize Full GPU Processor
-    std::cout << "\nStep 2: Initializing Full GPU Processor..." << std::endl;
-    GPUFullProcessor gpuProcessor;
-    
-    if (!gpuProcessor.initialize(allFitsFiles)) {
-        std::cerr << "Full GPU initialization failed" << std::endl;
-        return false;
-    }
-    
-    // Step 3: Collect valid tiles by scanning index directory (OPTIMIZED)
-    // Instead of iterating 4M+ tiles, directly scan existing index files
-    std::cout << "\nStep 3: Collecting valid tiles (optimized scan)..." << std::endl;
-    std::vector<GPUTileInfo> validTiles;
-    
-    int tileWidth = config.tileWidth;
-    int pixelsPerTile = tileWidth * tileWidth;
-    
-    // Calculate total possible tiles for statistics
-    for (int order = 0; order <= config.orderMax; order++) {
-        long nside = HealpixUtil::norderToNside(order);
-        g_stats.totalTiles += HealpixUtil::getTotalPixelsFromNside(nside);
-    }
-    
-    // Scan HpxFinder directory to find existing index files
-    for (int order = 0; order <= config.orderMax; order++) {
-        std::string orderPath = hpxFinderPath + "/Norder" + std::to_string(order);
-        
-        if (!fs::exists(orderPath)) continue;
-        
-        for (const auto& dirEntry : fs::directory_iterator(orderPath)) {
-            if (!dirEntry.is_directory()) continue;
-            
-            // Iterate index files in Dir*/
-            for (const auto& fileEntry : fs::directory_iterator(dirEntry.path())) {
-                if (!fileEntry.is_regular_file()) continue;
-                
-                std::string filename = fileEntry.path().filename().string();
-                // Parse Npix from filename (format: NpixXXXXX)
-                if (filename.substr(0, 4) != "Npix") continue;
-                
-                long npix = std::stol(filename.substr(4));
-                
-                std::vector<SourceFileInfo> sourceFiles = HpxFinder::readIndexFile(fileEntry.path().string());
-                
-                if (!sourceFiles.empty()) {
-                    GPUTileInfo info;
-                    info.order = order;
-                    info.npix = npix;
-                    
-                    for (const auto& sf : sourceFiles) {
-                        auto it = filenameToIndex.find(sf.filename);
-                        if (it != filenameToIndex.end()) {
-                            info.imageIndices.push_back(it->second);
-                        }
-                    }
-                    
-                    if (!info.imageIndices.empty()) {
-                        validTiles.push_back(info);
-                    }
-                }
-            }
-        }
-    }
-    
     g_stats.skippedTiles = g_stats.totalTiles - validTiles.size();
-    
+
     std::cout << "Found " << validTiles.size() << " tiles with data" << std::endl;
-    
+    if (builtFallbackSourceScan) {
+        std::cout << "Fallback source scan indexed " << fallbackScannedFiles
+                  << " files under " << sourceRootDir << std::endl;
+    } else {
+        std::cout << "Resolved source paths directly under " << sourceRootDir << std::endl;
+    }
+    std::cout << "Resolved " << sourceRefs.size() << " referenced source images" << std::endl;
+
+    bool appendAccumulatorMode = config.appendMode && config.overlayMode == OverlayMode::MEAN;
+    bool reuseAccumulatorCache = false;
+    if (appendAccumulatorMode && !validTiles.empty()) {
+        std::set<std::string> newSourceKeys;
+        Config newSourceScanConfig = config;
+        newSourceScanConfig.recursiveScan = true;
+        std::vector<std::string> newBatchFiles = scanFitsFiles(newSourceScanConfig);
+        for (const auto& filePath : newBatchFiles) {
+            fs::path relativePath = fs::path(filePath).lexically_relative(fs::path(sourceRootDir));
+            std::string relativeKey = relativePath.generic_string();
+            if (!relativeKey.empty() && relativeKey != "." && relativeKey.rfind("../", 0) != 0) {
+                newSourceKeys.insert(normalizeRelativePath(relativeKey));
+            }
+            newSourceKeys.insert(basenameFromPath(filePath));
+        }
+
+        bool allCachesPresent = true;
+        for (const auto& tile : validTiles) {
+            if (!fs::exists(buildAccumulatorCacheTilePath(config.outputDir, "weighted_sum", tile.order, tile.npix)) ||
+                !fs::exists(buildAccumulatorCacheTilePath(config.outputDir, "total_weight", tile.order, tile.npix))) {
+                allCachesPresent = false;
+                break;
+            }
+        }
+
+        if (allCachesPresent && !newSourceKeys.empty()) {
+            std::vector<SourceReferenceMeta> filteredSourceRefs;
+            std::map<int, int> sourceIndexRemap;
+            for (size_t i = 0; i < sourceRefs.size(); ++i) {
+                if (newSourceKeys.find(sourceRefs[i].sourceKey) == newSourceKeys.end()) {
+                    continue;
+                }
+                sourceIndexRemap[(int)i] = (int)filteredSourceRefs.size();
+                filteredSourceRefs.push_back(sourceRefs[i]);
+            }
+
+            std::vector<GPUTileInfo> filteredTiles;
+            filteredTiles.reserve(validTiles.size());
+            for (const auto& tile : validTiles) {
+                GPUTileInfo filtered = tile;
+                filtered.imageIndices.clear();
+                for (int imageIndex : tile.imageIndices) {
+                    auto it = sourceIndexRemap.find(imageIndex);
+                    if (it != sourceIndexRemap.end()) {
+                        filtered.imageIndices.push_back(it->second);
+                    }
+                }
+                if (filtered.imageIndices.empty()) {
+                    filteredTiles.clear();
+                    break;
+                }
+                filteredTiles.push_back(std::move(filtered));
+            }
+
+            if (!filteredTiles.empty() && filteredTiles.size() == validTiles.size()) {
+                validTiles = std::move(filteredTiles);
+                sourceRefs = std::move(filteredSourceRefs);
+                reuseAccumulatorCache = true;
+            }
+        }
+
+        std::cout << "Append accumulator cache mode: "
+                  << (reuseAccumulatorCache ? "reuse existing caches with new-source-only processing"
+                                            : "build or refresh caches from referenced sources")
+                  << std::endl;
+    }
+
     if (validTiles.empty()) {
         std::cout << "No tiles to process" << std::endl;
         return true;
     }
-    
-    // Step 4: Create xy2hpx mapping
+
+    // Step 2: Create xy2hpx mapping
     int tileOrder = 0;
     int temp = tileWidth;
     while (temp > 1) { temp >>= 1; tileOrder++; }
-    
+
     std::vector<int> xy2hpx, hpx2xy;
     HipsTileGenerator::createXY2HPXMapping(tileOrder, xy2hpx, hpx2xy);
-    
-    // Step 5: Process ALL tiles fully on GPU
-    std::cout << "\nStep 4: Processing ALL tiles fully on GPU..." << std::endl;
+
+    // Step 3: Plan partitioned cutouts from referenced sources
+    std::cout << "\nStep 2: Planning partitioned cutouts..." << std::endl;
+    std::vector<std::string> referencedPaths;
+    referencedPaths.reserve(sourceRefs.size());
+    for (const auto& ref : sourceRefs) {
+        referencedPaths.push_back(ref.fullPath);
+    }
+
+    std::vector<WCSInfo> wcsInfos = FastFitsHeaderReader::readWCSInfoBatch(referencedPaths);
+    std::vector<FitsData> sourceMetas(sourceRefs.size());
+    int metadataFallbackReads = 0;
+    size_t fullReferencedPixels = 0;
+
+    for (size_t i = 0; i < sourceRefs.size(); ++i) {
+        if (i < wcsInfos.size() && wcsInfos[i].valid) {
+            sourceMetas[i] = makeMetadataFitsData(sourceRefs[i].fullPath, wcsInfos[i]);
+        } else {
+            FitsData full = FitsReader::readFitsFile(sourceRefs[i].fullPath);
+            if (full.isValid) {
+                std::vector<float>().swap(full.pixels);
+                sourceMetas[i] = full;
+                metadataFallbackReads++;
+            }
+        }
+        sourceRefs[i].wcsOnly = sourceMetas[i];
+        if (sourceMetas[i].isValid) {
+            fullReferencedPixels += static_cast<size_t>(sourceMetas[i].width) * sourceMetas[i].height;
+        }
+    }
+
+    const int cutoutPadding = 8;
+    const int defaultPartitionSize = 512;
+    int wholeImageFallbackCount = 0;
+    int highCoverageFullImageCount = 0;
+    std::vector<std::vector<TileCutoutRequest>> tileRequests(validTiles.size());
+    std::vector<std::vector<PixelBounds>> sourceRequests(sourceRefs.size());
+
+    for (size_t tileIdx = 0; tileIdx < validTiles.size(); ++tileIdx) {
+        std::vector<CelestialCoord> tileSamples = sampleTileCelestialCoords(
+            validTiles[tileIdx].order,
+            validTiles[tileIdx].npix,
+            tileWidth,
+            xy2hpx
+        );
+
+        for (int sourceIndex : validTiles[tileIdx].imageIndices) {
+            if (sourceIndex < 0 || sourceIndex >= static_cast<int>(sourceMetas.size())) {
+                continue;
+            }
+            if (!sourceMetas[sourceIndex].isValid) {
+                continue;
+            }
+
+            PixelBounds bounds;
+            if (!estimateTileImageCutoutBounds(sourceMetas[sourceIndex], tileSamples, cutoutPadding, bounds)) {
+                bounds.x0 = 0;
+                bounds.y0 = 0;
+                bounds.width = sourceMetas[sourceIndex].width;
+                bounds.height = sourceMetas[sourceIndex].height;
+                wholeImageFallbackCount++;
+            }
+
+            if (bounds.width <= 0 || bounds.height <= 0) {
+                continue;
+            }
+
+            tileRequests[tileIdx].push_back({sourceIndex, bounds});
+            sourceRequests[sourceIndex].push_back(bounds);
+        }
+    }
+
+    CutoutLoadPlan loadPlan = build_cutout_load_plan(
+        sourceRequests,
+        sourceMetas,
+        defaultPartitionSize
+    );
+    highCoverageFullImageCount = loadPlan.high_coverage_full_image_count;
+
+    std::vector<int> partitionSizes = std::move(loadPlan.partition_sizes);
+    std::map<CutoutLoadKey, int> cellKeyToCutoutIndex = std::move(loadPlan.key_to_job_index);
+    std::vector<FitsData> allFitsFiles(loadPlan.jobs.size());
+    size_t cutoutPixelsLoaded = 0;
+
+    std::atomic<bool> loadFailed(false);
+    std::mutex loadErrorMutex;
+    std::string loadErrorMessage;
+
+    const int loadWorkerCount = std::max(
+        1,
+        std::min(static_cast<int>(loadPlan.jobs.size()), omp_get_max_threads())
+    );
+    const int loadChunkSize = choose_parallel_chunk_size(loadPlan.jobs.size(), loadWorkerCount, 4, 16);
+
+    if (!loadPlan.jobs.empty()) {
+        std::cout << "Parallel cutout load jobs: " << loadPlan.jobs.size()
+                  << " using " << loadWorkerCount
+                  << " workers (chunk=" << loadChunkSize << ")" << std::endl;
+    }
+
+#pragma omp parallel for schedule(dynamic, loadChunkSize) num_threads(loadWorkerCount)
+    for (int jobIndex = 0; jobIndex < static_cast<int>(loadPlan.jobs.size()); ++jobIndex) {
+        if (loadFailed.load(std::memory_order_relaxed)) {
+            continue;
+        }
+
+        const CutoutLoadJob& job = loadPlan.jobs[jobIndex];
+        const std::string& fullPath = sourceRefs[job.key.source_index].fullPath;
+        FitsData cutout = job.read_full_image
+            ? FitsReader::readFitsFile(fullPath, 0)
+            : FitsReader::readFitsCutout(fullPath, job.bounds, 0);
+
+        if (!cutout.isValid) {
+            bool expected = false;
+            if (loadFailed.compare_exchange_strong(expected, true)) {
+                std::ostringstream oss;
+                oss << "ERROR: Failed to read "
+                    << (job.read_full_image ? "full image from " : "cutout from ")
+                    << fullPath;
+                if (!job.read_full_image) {
+                    oss << " cell=(" << job.key.cell_x << "," << job.key.cell_y << ")";
+                }
+                std::lock_guard<std::mutex> lock(loadErrorMutex);
+                loadErrorMessage = oss.str();
+            }
+            continue;
+        }
+
+        allFitsFiles[jobIndex] = std::move(cutout);
+    }
+
+    if (loadFailed.load()) {
+        std::cerr << loadErrorMessage << std::endl;
+        return false;
+    }
+
+    for (const FitsData& cutout : allFitsFiles) {
+        cutoutPixelsLoaded += static_cast<size_t>(cutout.width) * cutout.height;
+    }
+
+    std::vector<GPUTileInfo> cutoutTiles;
+    cutoutTiles.reserve(validTiles.size());
+    for (size_t tileIdx = 0; tileIdx < validTiles.size(); ++tileIdx) {
+        std::set<int> uniqueCutoutIndices;
+
+        for (const auto& request : tileRequests[tileIdx]) {
+            int partitionSize = partitionSizes[request.sourceIndex];
+            if (partitionSize <= 0 || request.bounds.width <= 0 || request.bounds.height <= 0) {
+                continue;
+            }
+
+            int x0Cell = request.bounds.x0 / partitionSize;
+            int y0Cell = request.bounds.y0 / partitionSize;
+            int x1Cell = (request.bounds.x0 + request.bounds.width - 1) / partitionSize;
+            int y1Cell = (request.bounds.y0 + request.bounds.height - 1) / partitionSize;
+
+            for (int cellY = y0Cell; cellY <= y1Cell; ++cellY) {
+                for (int cellX = x0Cell; cellX <= x1Cell; ++cellX) {
+                    auto it = cellKeyToCutoutIndex.find({request.sourceIndex, cellX, cellY});
+                    if (it != cellKeyToCutoutIndex.end()) {
+                        uniqueCutoutIndices.insert(it->second);
+                    }
+                }
+            }
+        }
+
+        if (!uniqueCutoutIndices.empty()) {
+            GPUTileInfo info;
+            info.order = validTiles[tileIdx].order;
+            info.npix = validTiles[tileIdx].npix;
+            info.imageIndices.assign(uniqueCutoutIndices.begin(), uniqueCutoutIndices.end());
+            cutoutTiles.push_back(std::move(info));
+        }
+    }
+
+    validTiles = std::move(cutoutTiles);
+    g_stats.skippedTiles = g_stats.totalTiles - validTiles.size();
+
+    std::cout << "Metadata fallback reads: " << metadataFallbackReads << std::endl;
+    std::cout << "Whole-image fallback requests: " << wholeImageFallbackCount << std::endl;
+    std::cout << "High-coverage full-image loads: " << highCoverageFullImageCount << std::endl;
+    std::cout << "Loaded " << allFitsFiles.size() << " cutout cells" << std::endl;
+    if (fullReferencedPixels > 0) {
+        double loadFraction = 100.0 * static_cast<double>(cutoutPixelsLoaded) /
+                              static_cast<double>(fullReferencedPixels);
+        std::cout << "Cutout pixel load: " << cutoutPixelsLoaded << " / " << fullReferencedPixels
+                  << " (" << std::fixed << std::setprecision(2) << loadFraction
+                  << "% of referenced full-image pixels)" << std::endl;
+    }
+
+    if (allFitsFiles.empty() || validTiles.empty()) {
+        std::cout << "No cutout tiles to process" << std::endl;
+        return true;
+    }
+
+    // Step 4: Initialize Full GPU Processor with cutout cells
+    std::cout << "\nStep 3: Initializing Full GPU Processor..." << std::endl;
+    GPUFullProcessor gpuProcessor;
+    if (config.enableCoordCache) {
+        gpuProcessor.setCoordinateCacheRoot(config.outputDir);
+    }
+
+    if (!gpuProcessor.initialize(allFitsFiles)) {
+        std::cerr << "Full GPU initialization failed" << std::endl;
+        return false;
+    }
+
+    // Step 5: Process tiles on GPU
+    std::cout << "\nStep 4: Processing tiles on GPU..." << std::endl;
     std::vector<std::vector<double>> allResults;
-    
+    std::vector<std::vector<double>> combinedWeightedSums;
+    std::vector<std::vector<double>> combinedTotalWeights;
+
     // For float output (bitpix<0), output blank should be NaN (match Java)
     double outputBlank = (config.bitpix < 0) ? std::numeric_limits<double>::quiet_NaN() : config.blank;
-    
-    if (!gpuProcessor.processAllTiles(validTiles, tileWidth, xy2hpx, outputBlank, allResults, config.validMin, config.validMax)) {
-        std::cerr << "Full GPU processing failed" << std::endl;
-        return false;
+
+    if (appendAccumulatorMode) {
+        std::vector<std::vector<double>> partialWeightedSums;
+        std::vector<std::vector<double>> partialTotalWeights;
+        if (!gpuProcessor.processAllTilesWeightedStats(validTiles, tileWidth, xy2hpx, partialWeightedSums, partialTotalWeights)) {
+            std::cerr << "Full GPU weighted-stats processing failed" << std::endl;
+            return false;
+        }
+
+        combinedWeightedSums.resize(validTiles.size());
+        combinedTotalWeights.resize(validTiles.size());
+        allResults.resize(validTiles.size());
+
+        for (size_t t = 0; t < validTiles.size(); ++t) {
+            std::vector<double> previousWeightedSums;
+            std::vector<double> previousTotalWeights;
+            if (reuseAccumulatorCache) {
+                if (!readAccumulatorCacheTile(config.outputDir, "weighted_sum", validTiles[t].order, validTiles[t].npix, tileWidth, previousWeightedSums) ||
+                    !readAccumulatorCacheTile(config.outputDir, "total_weight", validTiles[t].order, validTiles[t].npix, tileWidth, previousTotalWeights)) {
+                    std::cerr << "Failed to read accumulator cache for tile " << validTiles[t].npix << std::endl;
+                    return false;
+                }
+            } else {
+                previousWeightedSums.assign(pixelsPerTile, 0.0);
+                previousTotalWeights.assign(pixelsPerTile, 0.0);
+            }
+
+            combinedWeightedSums[t].resize(pixelsPerTile);
+            combinedTotalWeights[t].resize(pixelsPerTile);
+            allResults[t].resize(pixelsPerTile);
+
+            for (int p = 0; p < pixelsPerTile; ++p) {
+                double sum = previousWeightedSums[p] + partialWeightedSums[t][p];
+                double weight = previousTotalWeights[p] + partialTotalWeights[t][p];
+                combinedWeightedSums[t][p] = sum;
+                combinedTotalWeights[t][p] = weight;
+                allResults[t][p] = (weight > 0.0) ? (sum / weight) : outputBlank;
+            }
+        }
+    } else {
+        if (!gpuProcessor.processAllTiles(validTiles, tileWidth, xy2hpx, outputBlank, allResults, config.bitpix, config.validMin, config.validMax)) {
+            std::cerr << "Full GPU processing failed" << std::endl;
+            return false;
+        }
     }
     
     // Step 6: Write tile files
@@ -1343,9 +1980,27 @@ bool runTilesStageFullGPU(Config& config) {
     std::atomic<int> failedCount(0);
     std::atomic<int> progressCount(0);
     int totalTiles = (int)validTiles.size();
+
+    std::vector<std::string> writeTargets;
+    writeTargets.reserve(validTiles.size() * (appendAccumulatorMode ? 3u : 1u));
+    for (const auto& info : validTiles) {
+        int dir = HealpixUtil::getDirNumber(info.npix);
+        std::ostringstream oss;
+        oss << config.outputDir << "/Norder" << info.order << "/Dir" << dir << "/Npix" << info.npix << ".fits";
+        writeTargets.push_back(oss.str());
+        if (appendAccumulatorMode) {
+            writeTargets.push_back(buildAccumulatorCacheTilePath(config.outputDir, "weighted_sum", info.order, info.npix));
+            writeTargets.push_back(buildAccumulatorCacheTilePath(config.outputDir, "total_weight", info.order, info.npix));
+        }
+    }
+    for (const auto& dir : collect_unique_parent_dirs(writeTargets)) {
+        fs::create_directories(dir);
+    }
+
+    const int writeChunkSize = choose_parallel_chunk_size(validTiles.size(), omp_get_max_threads());
     
     // Parallel write using OpenMP
-    #pragma omp parallel for schedule(dynamic, 100)
+    #pragma omp parallel for schedule(dynamic, writeChunkSize)
     for (size_t t = 0; t < validTiles.size(); t++) {
         const GPUTileInfo& info = validTiles[t];
         const std::vector<double>& tileResults = allResults[t];
@@ -1363,8 +2018,19 @@ bool runTilesStageFullGPU(Config& config) {
         int dir = HealpixUtil::getDirNumber(info.npix);
         std::ostringstream oss;
         oss << config.outputDir << "/Norder" << info.order << "/Dir" << dir << "/Npix" << info.npix << ".fits";
-        
-        if (FitsWriter::writeTileFile(oss.str(), tile, info.order, info.npix, config.frame)) {
+
+        bool writeOk = FitsWriter::writeTileFile(oss.str(), tile, info.order, info.npix, config.frame);
+        if (writeOk && appendAccumulatorMode) {
+            writeOk = writeAccumulatorCacheTile(
+                config.outputDir, "weighted_sum", info.order, info.npix, tileWidth,
+                combinedWeightedSums[t], config.frame
+            ) && writeAccumulatorCacheTile(
+                config.outputDir, "total_weight", info.order, info.npix, tileWidth,
+                combinedTotalWeights[t], config.frame
+            );
+        }
+
+        if (writeOk) {
             generatedCount++;
         } else {
             failedCount++;
@@ -1467,6 +2133,14 @@ int main(int argc, char* argv[]) {
     if (!parseArguments(argc, argv, config)) {
         return 1;
     }
+
+    if (config.sourceRootDir.empty()) {
+        config.sourceRootDir = config.inputDir;
+    }
+    if (config.appendMode && !config.enableIndex) {
+        std::cerr << "ERROR: -append requires INDEX stage to be enabled" << std::endl;
+        return 1;
+    }
     
     // Initialize from reference image if specified
     if (!config.imgEtalon.empty()) {
@@ -1547,8 +2221,12 @@ int main(int argc, char* argv[]) {
     // Display configuration
     std::cout << "Configuration:" << std::endl;
     std::cout << "  Input directory: " << config.inputDir << std::endl;
+    std::cout << "  Source root: " << config.sourceRootDir << std::endl;
     std::cout << "  Output directory: " << config.outputDir << std::endl;
     std::cout << "  HiPS ID: " << config.hipsId << std::endl;
+    std::cout << "  Append mode: " << (config.appendMode ? "yes" : "no") << std::endl;
+    std::cout << "  TREE rebuild: " << (config.enableTreeRebuild ? "enabled" : "disabled (default)") << std::endl;
+    std::cout << "  Coordinate cache: " << (config.enableCoordCache ? "enabled" : "disabled (default)") << std::endl;
     std::cout << "  Max order: " << config.orderMax << (orderWasAuto ? " (auto)" : " (user)") << std::endl;
     std::cout << "  Max threads: " << config.maxThreads << std::endl;
     std::cout << "  Tile size: " << config.tileWidth << "x" << config.tileWidth << std::endl;
@@ -1596,18 +2274,24 @@ int main(int argc, char* argv[]) {
     if (config.enableTiles) {
         bool success = false;
         if (config.forceCPU) {
+            if (config.appendMode) {
+                std::cerr << "ERROR: append mode currently requires the full GPU tiles path" << std::endl;
+                return 1;
+            }
             std::cout << "Forced CPU mode" << std::endl;
             success = runTilesStage(config);
         } else {
-            // Try FULL GPU processing first (all computation on GPU)
             success = runTilesStageFullGPU(config);
             if (!success) {
-                std::cerr << "ERROR: Full GPU processing failed, trying GPU batch mode..." << std::endl;
-                success = runTilesStageGPU(config);
-                if (!success) {
-                    std::cerr << "ERROR: GPU batch processing also failed!" << std::endl;
-                    std::cerr << "Please check GPU memory and reduce batch size or order." << std::endl;
-                    // No CPU fallback - fail fast
+                if (config.appendMode) {
+                    std::cerr << "ERROR: append mode failed in full GPU path; refusing slower full rebuild fallback" << std::endl;
+                } else {
+                    std::cerr << "ERROR: Full GPU processing failed, trying GPU batch mode..." << std::endl;
+                    success = runTilesStageGPU(config);
+                    if (!success) {
+                        std::cerr << "ERROR: GPU batch processing also failed!" << std::endl;
+                        std::cerr << "Please check GPU memory and reduce batch size or order." << std::endl;
+                    }
                 }
             }
         }
@@ -1618,135 +2302,125 @@ int main(int argc, char* argv[]) {
     } else {
         std::cout << "Skipping TILES stage" << std::endl;
     }
-    
-    // Generate Allsky preview
-    std::cout << "\n=== Generating Allsky preview ===" << std::endl;
-    if (!AllskyGenerator::generateAllskyFits(config.outputDir, 3, 64)) {
-        std::cerr << "WARNING: Allsky generation failed (not critical)" << std::endl;
+
+    if (config.appendMode) {
+        std::cout << "\n=== Append mode: skipping Allsky/properties/TREE rebuild ===" << std::endl;
+        std::cout << "\nHiPS generation completed successfully!" << std::endl;
+        return 0;
     }
     
-    // Generate properties metadata file
-    std::cout << "\n=== Generating properties metadata ===" << std::endl;
-    // Extract input directory name as title
-    std::string title = fs::path(config.inputDir).filename().string();
-    if (title.empty()) {
-        title = "HiPS";
-    }
-    
-    // Use validRange if set, otherwise use defaults
-    double pixelCutMin = config.hasValidRange ? config.validMin : -1.0;
-    double pixelCutMax = config.hasValidRange ? config.validMax : 1.0;
-    
-    PropertiesGenerator::generateProperties(
-        config.outputDir,
-        title,
+    // Defer preview generation until TREE has rebuilt lower orders when needed
+    bool runTreeRebuild = should_run_tree_rebuild(
+        config.appendMode,
+        config.enableTiles,
         config.orderMax,
-        config.tileWidth,
-        config.bitpix,
-        (int)g_stats.generatedTiles,
-        pixelCutMin,
-        pixelCutMax
+        config.enableTreeRebuild
     );
-    std::cout << "Properties file generated" << std::endl;
+    bool deferPreviewUntilTree = should_defer_preview_until_tree(config.orderMax, runTreeRebuild);
+    if (!deferPreviewUntilTree) {
+        if (config.orderMax > 3) {
+            if (runTreeRebuild) {
+                generateAllskyPreview(config);
+            } else {
+                std::cout << "\n=== Skipping Allsky preview (TREE rebuild disabled; lower-order tiles unavailable) ===" << std::endl;
+            }
+            generatePropertiesMetadata(config);
+        }
+    } else {
+        std::cout << "\n=== Deferring Allsky/properties until after TREE stage ===" << std::endl;
+    }
     
-    // TREE stage disabled - directly generate tiles from source images at all orders
-    // (can be enabled later if needed to match Java's hierarchical approach)
-    std::cout << "\n=== TREE stage (disabled) ===" << std::endl;
-    if (false) {  // DISABLED
+    if (runTreeRebuild) {
+        std::cout << "\n=== TREE stage ===" << std::endl;
     
-    // Process from orderMax-1 down to 0
-    for (int order = config.orderMax - 1; order >= 0; order--) {
-        long nside = HealpixUtil::norderToNside(order);
-        long totalPixels = HealpixUtil::getTotalPixelsFromNside(nside);
-        int tileWidth = config.tileWidth;
-        
-        int tilesRebuilt = 0;
-        
-        for (long npix = 0; npix < totalPixels; npix++) {
-            // Build the path for this tile
-            int dir = HealpixUtil::getDirNumber(npix);
-            std::ostringstream tilePath;
-            tilePath << config.outputDir << "/Norder" << order << "/Dir" << dir << "/Npix" << npix << ".fits";
+        // Process from orderMax-1 down to 0
+        for (int order = config.orderMax - 1; order >= 0; order--) {
+            long nside = HealpixUtil::norderToNside(order);
+            long totalPixels = HealpixUtil::getTotalPixelsFromNside(nside);
+            int tileWidth = config.tileWidth;
             
-            // Check if all 4 child tiles exist
-            long childNpix0 = npix * 4;
-            bool allChildrenExist = true;
-            std::vector<std::string> childPaths(4);
+            int tilesRebuilt = 0;
             
-            for (int c = 0; c < 4; c++) {
-                long childNpix = childNpix0 + c;
-                int childDir = HealpixUtil::getDirNumber(childNpix);
-                std::ostringstream childPath;
-                childPath << config.outputDir << "/Norder" << (order + 1) 
-                          << "/Dir" << childDir << "/Npix" << childNpix << ".fits";
-                childPaths[c] = childPath.str();
+            for (long npix = 0; npix < totalPixels; npix++) {
+                int dir = HealpixUtil::getDirNumber(npix);
+                std::ostringstream tilePath;
+                tilePath << config.outputDir << "/Norder" << order << "/Dir" << dir << "/Npix" << npix << ".fits";
                 
-                if (!fs::exists(childPaths[c])) {
-                    allChildrenExist = false;
-                    break;
+                long childNpix0 = npix * 4;
+                bool allChildrenExist = true;
+                std::vector<std::string> childPaths(4);
+                
+                for (int c = 0; c < 4; c++) {
+                    long childNpix = childNpix0 + c;
+                    int childDir = HealpixUtil::getDirNumber(childNpix);
+                    std::ostringstream childPath;
+                    childPath << config.outputDir << "/Norder" << (order + 1)
+                              << "/Dir" << childDir << "/Npix" << childNpix << ".fits";
+                    childPaths[c] = childPath.str();
+                    
+                    if (!fs::exists(childPaths[c])) {
+                        allChildrenExist = false;
+                        break;
+                    }
                 }
-            }
-            
-            if (!allChildrenExist) {
-                continue;
-            }
-            
-            // Read child tiles and compute average (treeMean)
-            std::vector<float> parentPixels(tileWidth * tileWidth, std::numeric_limits<float>::quiet_NaN());
-            
-            for (int c = 0; c < 4; c++) {
-                FitsData childData = FitsReader::readFitsFile(childPaths[c]);
-                if (!childData.isValid) continue;
                 
-                // Each child occupies a quadrant of the parent
-                // Quadrant mapping: 0=bottom-left, 1=bottom-right, 2=top-left, 3=top-right
-                int offX = (c & 1) ? tileWidth / 2 : 0;
-                int offY = (c & 2) ? tileWidth / 2 : 0;
+                if (!allChildrenExist) {
+                    continue;
+                }
                 
-                // Average 2x2 pixels from child to 1 pixel in parent
-                int halfWidth = tileWidth / 2;
-                for (int py = 0; py < halfWidth; py++) {
-                    for (int px = 0; px < halfWidth; px++) {
-                        double sum = 0;
-                        int count = 0;
-                        
-                        // Average 2x2 block from child
-                        for (int dy = 0; dy < 2; dy++) {
-                            for (int dx = 0; dx < 2; dx++) {
-                                int cx = px * 2 + dx;
-                                int cy = py * 2 + dy;
-                                int childIdx = cy * tileWidth + cx;
-                                if (childIdx < (int)childData.pixels.size()) {
-                                    float val = childData.pixels[childIdx];
-                                    if (!std::isnan(val)) {
-                                        sum += val;
-                                        count++;
+                std::vector<float> parentPixels(tileWidth * tileWidth, std::numeric_limits<float>::quiet_NaN());
+                
+                for (int c = 0; c < 4; c++) {
+                    FitsData childData = FitsReader::readFitsFile(childPaths[c]);
+                    if (!childData.isValid) continue;
+                    
+                    int offX = (c & 1) ? tileWidth / 2 : 0;
+                    int offY = (c & 2) ? tileWidth / 2 : 0;
+                    int halfWidth = tileWidth / 2;
+                    for (int py = 0; py < halfWidth; py++) {
+                        for (int px = 0; px < halfWidth; px++) {
+                            double sum = 0;
+                            int count = 0;
+                            for (int dy = 0; dy < 2; dy++) {
+                                for (int dx = 0; dx < 2; dx++) {
+                                    int cx = px * 2 + dx;
+                                    int cy = py * 2 + dy;
+                                    int childIdx = cy * tileWidth + cx;
+                                    if (childIdx < (int)childData.pixels.size()) {
+                                        float val = childData.pixels[childIdx];
+                                        if (!std::isnan(val)) {
+                                            sum += val;
+                                            count++;
+                                        }
                                     }
                                 }
                             }
-                        }
-                        
-                        if (count > 0) {
-                            int parentIdx = (offY + py) * tileWidth + (offX + px);
-                            parentPixels[parentIdx] = (float)(sum / count);
+                            if (count > 0) {
+                                int parentIdx = (offY + py) * tileWidth + (offX + px);
+                                parentPixels[parentIdx] = (float)(sum / count);
+                            }
                         }
                     }
                 }
+                
+                fs::create_directories(fs::path(tilePath.str()).parent_path());
+                FitsWriter::writeFitsFile(tilePath.str(), parentPixels.data(), tileWidth, tileWidth, -32);
+                tilesRebuilt++;
             }
             
-            // Write the parent tile
-            fs::create_directories(fs::path(tilePath.str()).parent_path());
-            FitsWriter::writeFitsFile(tilePath.str(), parentPixels.data(), 
-                                      tileWidth, tileWidth, -32);
-            tilesRebuilt++;
+            if (tilesRebuilt > 0) {
+                std::cout << "  Order " << order << ": rebuilt " << tilesRebuilt << " tiles from children" << std::endl;
+            }
         }
-        
-        if (tilesRebuilt > 0) {
-            std::cout << "  Order " << order << ": rebuilt " << tilesRebuilt << " tiles from children" << std::endl;
+        std::cout << "TREE generation complete" << std::endl;
+
+        if (config.orderMax > 3) {
+            generateAllskyPreview(config);
+            generatePropertiesMetadata(config);
         }
+    } else {
+        std::cout << "\n=== TREE stage skipped (default; use -tree to enable lower-order rebuild) ===" << std::endl;
     }
-    std::cout << "TREE generation complete" << std::endl;
-    }  // END DISABLED TREE
     
     std::cout << "\n=== HiPS Generation Complete! ===" << std::endl;
     std::cout << "Output directory: " << config.outputDir << std::endl;

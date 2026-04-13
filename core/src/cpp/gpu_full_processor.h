@@ -9,8 +9,10 @@
 
 #include <vector>
 #include <string>
+#include <limits>
 #include "fits_io.h"
 #include "coordinate_transform.h"
+#include "gpu_full_batch_plan.h"
 
 /**
  * WCS parameters for GPU (plain struct, no methods)
@@ -49,6 +51,8 @@ public:
      * @return true if successful
      */
     bool initialize(const std::vector<FitsData>& fitsFiles);
+
+    void setCoordinateCacheRoot(const std::string& outputDir);
     
     /**
      * Process all tiles using GPU for WCS projection and interpolation
@@ -65,8 +69,17 @@ public:
         const std::vector<int>& xy2hpx,
         double blank,
         std::vector<std::vector<double>>& results,
+        int outputBitpix = -32,
         double validMin = -std::numeric_limits<double>::infinity(),
         double validMax = std::numeric_limits<double>::infinity()
+    );
+
+    bool processAllTilesWeightedStats(
+        const std::vector<GPUTileInfo>& tiles,
+        int tileWidth,
+        const std::vector<int>& xy2hpx,
+        std::vector<std::vector<double>>& weightedSums,
+        std::vector<std::vector<double>>& totalWeights
     );
     
     void release();
@@ -84,6 +97,9 @@ private:
         std::vector<double>& decCoords
     );
 
+    bool ensureBatchWorkspace(const BatchWorkspacePlan& plan);
+    void releaseBatchWorkspace();
+
     // GPU memory for source images
     float* m_d_allPixels;
     size_t* m_d_imageOffsets;
@@ -100,9 +116,20 @@ private:
     int* m_d_widths;
     int* m_d_heights;
     float* m_d_blanks;
+
+    // Reusable batch workspace
+    double* m_d_raCoords;
+    double* m_d_decCoords;
+    void* m_d_results;
+    int* m_d_imageMasks;
+    size_t m_allocatedOutputPixels;
+    size_t m_allocatedMaskInts;
+    size_t m_resultElementBytes;
+    bool m_useFloatResults;
     
     // Host data
     std::vector<WCSParams> m_wcsParams;
+    std::string m_coordinateCacheRoot;
     int m_numImages;
     size_t m_totalPixels;
     bool m_initialized;
@@ -112,6 +139,73 @@ private:
  * CUDA kernel launcher with precomputed coordinates
  * Uses official HEALPix library coordinates from CPU
  */
+extern "C" void launchFullGPUTileKernelWithCoordsFloat(
+    // Source images
+    const float* d_allPixels,
+    const size_t* d_imageOffsets,
+    // WCS parameters (per image)
+    const double* d_crval1, const double* d_crval2,
+    const double* d_crpix1, const double* d_crpix2,
+    const double* d_cd1_1, const double* d_cd1_2,
+    const double* d_cd2_1, const double* d_cd2_2,
+    const int* d_widths, const int* d_heights,
+    const float* d_blanks,
+    int numImages,
+    // Precomputed celestial coordinates (from official HEALPix library)
+    const double* d_raCoords,   // [numTiles * tileWidth * tileWidth]
+    const double* d_decCoords,  // [numTiles * tileWidth * tileWidth]
+    // Tile parameters
+    const int* d_imageMasks,    // [numTiles * numImages] - which images to process for each tile
+    int tileWidth,
+    int numTiles,
+    // Output
+    float* d_results,           // [numTiles * tileWidth * tileWidth]
+    double outputBlank
+);
+
+extern "C" void launchFullGPUTileKernelWithCoordsDouble(
+    // Source images
+    const float* d_allPixels,
+    const size_t* d_imageOffsets,
+    // WCS parameters (per image)
+    const double* d_crval1, const double* d_crval2,
+    const double* d_crpix1, const double* d_crpix2,
+    const double* d_cd1_1, const double* d_cd1_2,
+    const double* d_cd2_1, const double* d_cd2_2,
+    const int* d_widths, const int* d_heights,
+    const float* d_blanks,
+    int numImages,
+    // Precomputed celestial coordinates (from official HEALPix library)
+    const double* d_raCoords,   // [numTiles * tileWidth * tileWidth]
+    const double* d_decCoords,  // [numTiles * tileWidth * tileWidth]
+    // Tile parameters
+    const int* d_imageMasks,    // [numTiles * numImages] - which images to process for each tile
+    int tileWidth,
+    int numTiles,
+    // Output
+    double* d_results,          // [numTiles * tileWidth * tileWidth]
+    double outputBlank
+);
+
+extern "C" void launchFullGPUTileKernelWithCoordsSparseAccum(
+    const float* d_allPixels,
+    const size_t* d_imageOffsets,
+    const double* d_crval1, const double* d_crval2,
+    const double* d_crpix1, const double* d_crpix2,
+    const double* d_cd1_1, const double* d_cd1_2,
+    const double* d_cd2_1, const double* d_cd2_2,
+    const int* d_widths, const int* d_heights,
+    const float* d_blanks,
+    const double* d_raCoords,
+    const double* d_decCoords,
+    const int* d_tileImageOffsets,
+    const int* d_tileImageIndices,
+    int tileWidth,
+    int numTiles,
+    double* d_weightedSums,
+    double* d_totalWeights
+);
+
 extern "C" void launchFullGPUTileKernelWithCoords(
     // Source images
     const float* d_allPixels,
